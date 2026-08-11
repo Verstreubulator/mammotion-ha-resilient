@@ -1,0 +1,14 @@
+# Never publish real secrets — this repo uses Home Assistant's !secret placeholders instead.
+secrets.yaml
+secrets.yml
+*.secret
+.storage/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.vscode/
+.idea/

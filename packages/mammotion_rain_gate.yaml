@@ -1,0 +1,376 @@
+# =============================================================================
+# Mammotion Rain Gate — a generic "don't mow wet grass" veto
+# =============================================================================
+# WHAT THIS IS
+#   A small, self-contained Home Assistant package that produces one clean
+#   boolean you can hang off your mow scripts as a precondition:
+#
+#       binary_sensor.mow_rain_veto   ->  ON = "too wet, don't start a mow"
+#
+#   It is deliberately conservative: it holds the mow when it's raining now,
+#   for a dry-out window after meaningful rain, AND when the rain data itself
+#   is missing (a sensor dropping offline should never quietly clear the veto).
+#
+# THE ONE LESSON WORTH KEEPING (learned the slow way in our own yard)
+#   Gate on rain ACCUMULATION over a window, NOT on instantaneous rain-RATE.
+#   A piezo/tipping rain sensor reports a rate for mist, dew, vibration, even a
+#   spider on the cone — fractions of an inch/hour with essentially no water on
+#   the grass. If you veto on "rate > 0" you skip perfectly dry days. Instead we
+#   watch a per-storm accumulation counter and only "count" a storm once it has
+#   added at least a small DEPTH of fresh rain (~0.03-0.06 inch, tunable). That
+#   depth is what actually wets the blades. Real irrigation rain-skips work the
+#   same way (they use a depth like 1/8"). See docs for the full write-up.
+#
+# HOW TO INSTALL
+#   1. Copy this file into your `config/packages/` folder. If you don't have
+#      packages enabled yet, add this to configuration.yaml:
+#          homeassistant:
+#            packages: !include_dir_named packages
+#   2. Wire YOUR rain sensors in the two places marked  # <<< EDIT  below.
+#   3. Restart Home Assistant (Developer Tools -> YAML -> Restart, or a full
+#      restart). Template + input_* entities are created on restart.
+#   4. Seed the two "once" helpers (see the SEEDING note near the bottom).
+#   5. Reference binary_sensor.mow_rain_veto from your mow scripts (see the
+#      "USING THE VETO" note at the very bottom).
+#
+# WHAT YOU MUST PROVIDE (your own sensors — any brand/integration)
+#   * A per-storm rain ACCUMULATION sensor, in inches, that increases as rain
+#     falls and resets to ~0 after a long dry gap. Ecowitt "event rain", an
+#     rtl_433/SDR "rain_event" sensor, a Tempest/WeatherFlow accumulation field,
+#     etc. This is the PRIMARY input.  -> sensor.YOUR_RAIN_ACCUMULATION
+#   * (Optional) A rain-RATE sensor in inch/hour, for the "it's raining right
+#     now" term.                        -> sensor.YOUR_RAIN_RATE
+#   * (Optional, alternative) A plain wet/leak binary sensor (a rain plate, a
+#     leak puck on the lawn). Useful if you have no accumulation counter at all.
+#                                        -> binary_sensor.YOUR_RAIN_SENSOR
+#   If you only have ONE of these, that's fine — see the state template comments
+#   for how to drop the terms you don't have.
+#
+# WHAT THIS DOES NOT DO
+#   This is the START gate (don't begin a mow). Cancelling a mow already in
+#   progress when a heavy shower rolls in is a separate concern; we ship a
+#   `binary_sensor.mow_rain_significant` here for that too, but wiring a
+#   mid-mow cancel is up to you (call your dock/cancel script from an automation
+#   that triggers on it). Keep it a higher rate threshold than the start gate.
+#
+#   In our own setup we ALSO layered a VPD "dew discriminator" on top (so that
+#   near-saturated dawn air that wets a plate is told apart from real rain), and
+#   a per-yard VPD scheduler. Those are tied to our specific sensors and are NOT
+#   included here — see examples/vpd-scheduling-example.md for that as
+#   inspiration, not a drop-in.
+#
+# CREDIT
+#   This whole project sits on top of the community integration
+#   mikey0000/Mammotion-HA and the pymammotion library. Thank you to the
+#   maintainers and contributors — none of this exists without their work. This
+#   file is just userspace glue around what they provide.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Tunable knobs. None have `initial:` so they PERSIST at whatever you tune them
+# to across restarts. See the SEEDING note at the bottom — an input_number with
+# no `initial:` comes up at its `min:` the very first time, so seed the two that
+# matter once via Developer Tools -> Actions -> input_number.set_value.
+# -----------------------------------------------------------------------------
+input_number:
+  # Minimum fresh accumulation (inches) for a storm to "count" as meaningful and
+  # (re)start the dry-out clock. THIS is the anti-mist knob. 0.03 is a good
+  # start; raise toward 0.06 if a noisy/creeping accumulation sensor keeps
+  # re-triggering. Real rain (>= ~0.1") always clears it.
+  mow_rain_min_event_in:
+    name: Mow Rain Min Event Depth
+    icon: mdi:cup-water
+    min: 0
+    max: 1
+    step: 0.005
+    unit_of_measurement: in
+    mode: box
+
+  # How many hours must pass AFTER meaningful rain before mowing is allowed
+  # again (the grass-drying window). 4 h is a reasonable start; sunny/breezy
+  # yards dry faster, shaded ones slower.
+  mow_dry_hours_required:
+    name: Mow Dry Hours Required
+    icon: mdi:weather-sunny
+    min: 0
+    max: 24
+    step: 0.5
+    unit_of_measurement: h
+    mode: box
+
+  # Rate (inch/hour) at/above which we call it "actively raining now" for the
+  # START gate. Sustained for `mow_rain_meaningful_minutes` so a brief blip
+  # doesn't trip it. Only used if you have a rain-RATE sensor.
+  mow_rain_meaningful_rate:
+    name: Mow Rain Meaningful Rate
+    icon: mdi:weather-rainy
+    min: 0
+    max: 2
+    step: 0.01
+    unit_of_measurement: in/h
+    mode: box
+  mow_rain_meaningful_minutes:
+    name: Mow Rain Meaningful Minutes
+    icon: mdi:timer-sand
+    min: 0
+    max: 30
+    step: 1
+    unit_of_measurement: min
+    mode: box
+
+  # Higher rate that means "heavy enough to cancel a RUNNING mow" (mid-mow).
+  # Drives binary_sensor.mow_rain_significant. Wire your own cancel automation
+  # to that sensor if you want mid-mow protection.
+  mow_rain_significant_rate:
+    name: Mow Rain Significant Rate
+    icon: mdi:weather-pouring
+    min: 0
+    max: 2
+    step: 0.01
+    unit_of_measurement: in/h
+    mode: box
+  mow_rain_significant_minutes:
+    name: Mow Rain Significant Minutes
+    icon: mdi:timer-sand
+    min: 0
+    max: 30
+    step: 1
+    unit_of_measurement: min
+    mode: box
+
+  # Internal bookkeeping (NOT a user knob): the accumulation value at the last
+  # dry-clock stamp. The stamping automation only re-stamps once accumulation
+  # rises >= min_event_in BEYOND this, so the depth test applies to each fresh
+  # CHUNK of rain, not the storm's running total. Seeded once (see SEEDING).
+  mow_rain_stamp_baseline:
+    name: Mow Rain Stamp Baseline
+    icon: mdi:counter
+    min: 0
+    max: 100
+    step: 0.001
+    unit_of_measurement: in
+    mode: box
+
+input_boolean:
+  # Master on/off for the whole veto. When OFF the binary_sensor still reflects
+  # reality (handy on a dashboard) but your mow scripts should ignore it — see
+  # the precondition example at the bottom, which ANDs this in. Default it ON.
+  mow_rain_veto_enabled:
+    name: Mow Rain Veto Enabled
+    icon: mdi:weather-rainy
+
+input_datetime:
+  # The anchor for the dry-out clock: the timestamp of the last MEANINGFUL rain.
+  # Stamped by automation `mow_stamp_meaningful_rain` below. Seed once to a date
+  # in the past (e.g. 2020-01-01) so the lawn isn't falsely "wet" at creation.
+  mow_last_meaningful_rain:
+    name: Mow Last Meaningful Rain
+    has_date: true
+    has_time: true
+    icon: mdi:weather-rainy
+
+# -----------------------------------------------------------------------------
+# The signals.
+# -----------------------------------------------------------------------------
+template:
+  # Plain, always-on state binary_sensors for the mid-mow "raining now" tiers.
+  # delay_on gives a sustained-rain debounce so drizzle/gusts don't trip them.
+  # float(0) means: if the rate sensor is missing, these read OFF (they are the
+  # "cancel a mow" side — failing safe there is failing OFF, i.e. don't cancel;
+  # the START gate below fails the OTHER way and holds the mow).
+  - binary_sensor:
+      - name: "Mow Rain Significant"
+        unique_id: mow_rain_significant
+        device_class: moisture
+        icon: mdi:weather-pouring
+        delay_on: "{{ (states('input_number.mow_rain_significant_minutes') | float(2) * 60) | int }}"
+        state: >
+          {{ states('sensor.YOUR_RAIN_RATE') | float(0)
+             >= (states('input_number.mow_rain_significant_rate') | float(0.10)) }}
+          # <<< EDIT: sensor.YOUR_RAIN_RATE  (inch/hour). No rate sensor? Delete
+          #     this whole binary_sensor block — the start gate below still works
+          #     off accumulation alone.
+
+  # The START gate. Trigger-based so it re-evaluates on a timer and on its
+  # inputs, and so unavailable inputs are handled explicitly rather than leaving
+  # a stale state. delay_on/delay_off debounce the edges.
+  - trigger:
+      - trigger: homeassistant
+        event: start
+      - trigger: time_pattern
+        minutes: "/5"
+      - trigger: state
+        entity_id:
+          - sensor.YOUR_RAIN_RATE                       # <<< EDIT (optional term)
+          - binary_sensor.YOUR_RAIN_SENSOR              # <<< EDIT (optional term)
+          - input_datetime.mow_last_meaningful_rain
+          - input_number.mow_dry_hours_required
+          - input_number.mow_rain_meaningful_rate
+    binary_sensor:
+      - name: "Mow Rain Veto"
+        unique_id: mow_rain_veto
+        device_class: moisture
+        icon: mdi:weather-pouring
+        # Debounce: assert quickly (30s) but hold the veto for 10 min after the
+        # last "wet" reading so a flapping sensor can't repeatedly clear it.
+        delay_on: "00:00:30"
+        delay_off: "00:10:00"
+        # ON ("too wet to mow") if ANY of:
+        #   (a) it's raining now at/above the meaningful rate, OR
+        #   (b) meaningful rain fell less than `mow_dry_hours_required` ago
+        #       (the dry-out window; anchored to ACCUMULATION, see automation), OR
+        #   (c) an optional wet/leak plate is reporting wet right now, OR
+        #   (d) the rain data is UNKNOWN/UNAVAILABLE (fail safe -> treat as wet).
+        # Delete any term whose sensor you don't have. Keep term (d).
+        state: >
+          {% set rate_raw = states('sensor.YOUR_RAIN_RATE') %}
+          {% set rate = rate_raw | float(-1) %}
+          {% set mean_rate = states('input_number.mow_rain_meaningful_rate') | float(0.04) %}
+          {% set dry_req = states('input_number.mow_dry_hours_required') | float(4) %}
+          {% set last_ts = as_timestamp(states('input_datetime.mow_last_meaningful_rain'), 0) %}
+          {% set hrs = (now().timestamp() - last_ts) / 3600 if last_ts > 0 else 999 %}
+          {# (a) raining now — rate < 0 means the rate sensor was missing, which
+             we treat as "raw data bad" below, not as "not raining". #}
+          {% set raining_now = rate >= mean_rate %}
+          {# (b) inside the post-rain dry-out window #}
+          {% set recent = hrs < dry_req %}
+          {# (c) optional wet plate. is_state()=='on' is false when it's offline,
+             so an offline plate does NOT assert wet on its own — term (d) covers
+             the genuinely-blind case. Delete if you have no such sensor. #}
+          {% set plate_wet = is_state('binary_sensor.YOUR_RAIN_SENSOR', 'on') %}
+          {# (d) fail-safe: if the RATE sensor is unavailable, hold the mow. If
+             you rely only on the accumulation dry-clock and a wet plate, change
+             this to test those instead (or drop it). #}
+          {% set data_bad = rate_raw in ['unknown', 'unavailable', 'none', None] %}
+          {{ raining_now or recent or plate_wet or data_bad }}
+        attributes:
+          rain_rate_in_hr: "{{ states('sensor.YOUR_RAIN_RATE') }}"
+          accumulation_in: "{{ states('sensor.YOUR_RAIN_ACCUMULATION') }}"
+          last_meaningful_rain: "{{ states('input_datetime.mow_last_meaningful_rain') }}"
+          hours_since_rain: >
+            {% set last_ts = as_timestamp(states('input_datetime.mow_last_meaningful_rain'), 0) %}
+            {% if last_ts > 0 %}{{ ((now().timestamp() - last_ts) / 3600) | round(1) }}
+            {% else %}unknown{% endif %}
+          dry_hours_required: "{{ states('input_number.mow_dry_hours_required') | float(4) }}"
+          min_event_in: "{{ states('input_number.mow_rain_min_event_in') | float(0.03) }}"
+
+# -----------------------------------------------------------------------------
+# Accumulation stamper — THE reason this gate is accurate.
+# Watches your per-storm accumulation counter and stamps
+# input_datetime.mow_last_meaningful_rain = now() ONLY once accumulation has
+# risen >= mow_rain_min_event_in BEYOND the last stamp's baseline. So the depth
+# test applies to each fresh CHUNK of rain, not the running total — a light late
+# drizzle below the depth can't re-reset a clock already anchored to the real
+# shower. Sub-threshold mist (no accumulation) never stamps at all. A per-storm
+# counter RESET (new < old, i.e. the station cleared the event after a dry gap)
+# just drops the baseline — a reset isn't rain.
+# -----------------------------------------------------------------------------
+automation:
+  - id: mow_stamp_meaningful_rain
+    alias: "Mow — Stamp Meaningful Rain (accumulation-anchored)"
+    description: >-
+      Anchors the rain veto's dry clock to REAL accumulation instead of rate.
+      Stamps mow_last_meaningful_rain only when a fresh chunk of >= min_event_in
+      has fallen since the last stamp. See file header for the why.
+    triggers:
+      - trigger: state
+        entity_id: sensor.YOUR_RAIN_ACCUMULATION      # <<< EDIT: per-storm event rain, inches
+    conditions:
+      # Ignore the unavailable<->value flaps so a reboot of the weather station
+      # doesn't read as a counter reset.
+      - condition: template
+        value_template: >-
+          {{ trigger.to_state.state not in ['unknown','unavailable']
+             and trigger.from_state.state not in ['unknown','unavailable'] }}
+    actions:
+      - variables:
+          n: "{{ trigger.to_state.state | float(0) }}"
+          o: "{{ trigger.from_state.state | float(0) }}"
+          base: "{{ states('input_number.mow_rain_stamp_baseline') | float(0) }}"
+          depth: "{{ states('input_number.mow_rain_min_event_in') | float(0.03) }}"
+      - choose:
+          # Per-storm counter reset: drop the baseline so the next storm
+          # accumulates from zero. No stamp — a reset isn't rain.
+          - conditions: "{{ n < o }}"
+            sequence:
+              - action: input_number.set_value
+                target: { entity_id: input_number.mow_rain_stamp_baseline }
+                data: { value: "{{ n }}" }
+          # A fresh chunk of >= depth has fallen since the last stamp: reset the
+          # dry clock (= "meaningful rain just happened") and advance the baseline.
+          - conditions: "{{ (n - base) >= depth }}"
+            sequence:
+              - action: input_datetime.set_datetime
+                target: { entity_id: input_datetime.mow_last_meaningful_rain }
+                data: { datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}" }
+              - action: input_number.set_value
+                target: { entity_id: input_number.mow_rain_stamp_baseline }
+                data: { value: "{{ n }}" }
+              - action: logbook.log
+                data:
+                  name: Mower Rain
+                  entity_id: binary_sensor.mow_rain_veto
+                  message: >-
+                    Meaningful rain +{{ (n - base) | round(3) }} in (event total
+                    {{ n }} in, >= {{ depth }} in chunk) — dry clock reset to
+                    {{ states('input_number.mow_dry_hours_required') }} h.
+    mode: single
+
+# =============================================================================
+# SEEDING (do this ONCE after the first restart)
+# =============================================================================
+# The two helpers below have no `initial:` on purpose (so they persist at your
+# tuned values). On first creation an input_number sits at its min and an
+# input_datetime at epoch, which would mislead the logic — so seed them once via
+# Developer Tools -> Actions:
+#
+#   input_number.set_value
+#     target: input_number.mow_rain_min_event_in     value: 0.03
+#   input_number.set_value
+#     target: input_number.mow_rain_meaningful_rate  value: 0.04
+#   input_number.set_value
+#     target: input_number.mow_rain_significant_rate value: 0.10
+#   input_number.set_value
+#     target: input_number.mow_rain_stamp_baseline
+#       value: <the CURRENT reading of sensor.YOUR_RAIN_ACCUMULATION>
+#   input_datetime.set_datetime
+#     target: input_datetime.mow_last_meaningful_rain
+#       datetime: "2020-01-01 00:00:00"   (= "no recent meaningful rain")
+#   input_boolean.turn_on
+#     target: input_boolean.mow_rain_veto_enabled
+#
+# =============================================================================
+# USING THE VETO — reference it from your mow scripts as a precondition
+# =============================================================================
+# Add a guard at the TOP of each mow script (mow_the_front_yard,
+# mow_the_backyard, mow_the_yard, ...). When wet, log/notify and stop — don't
+# start the mower:
+#
+#   sequence:
+#     - if:
+#         - condition: state
+#           entity_id: input_boolean.mow_rain_veto_enabled
+#           state: "on"
+#         - condition: state
+#           entity_id: binary_sensor.mow_rain_veto
+#           state: "on"
+#       then:
+#         - action: logbook.log
+#           data:
+#             name: "Mow"
+#             message: >-
+#               Skipped by rain veto — {{ state_attr('binary_sensor.mow_rain_veto',
+#               'hours_since_rain') }}h since rain (need
+#               {{ states('input_number.mow_dry_hours_required') }}h).
+#         # optional: notify/announce here
+#         - stop: "Rain veto"
+#     # ... the rest of your normal mow sequence ...
+#
+# If you run a dispatcher/automation, add the same as two conditions:
+#     - condition: state
+#       entity_id: binary_sensor.mow_rain_veto
+#       state: "off"
+#     - condition: state
+#       entity_id: input_boolean.mow_rain_veto_enabled
+#       state: "on"
+# =============================================================================

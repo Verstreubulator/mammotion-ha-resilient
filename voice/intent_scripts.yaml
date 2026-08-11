@@ -1,0 +1,285 @@
+# ============================================================================
+# OPTIONAL VOICE LAYER — intent handlers for mower control
+# ============================================================================
+# These are the handlers for the four Assist intents defined in
+# voice/intents/mower.yaml. Each handler does two things:
+#
+#   1. speech.text  — an IMMEDIATE spoken REPLY, computed from the core status
+#                     sensors so it is accurate ("Battery at 54 percent...",
+#                     "Mower offline...", "Starting front yard.").
+#   2. action       — a meaningful pre-check, then it launches the matching
+#                     ORCHESTRATION script. It never drives the mower directly.
+#
+# WHAT THIS DEPENDS ON (this file is useless without the lower tiers):
+#   - Core status tier:   sensor.mower_status, binary_sensor.mammotion_integration_healthy,
+#                         input_boolean.mammotion_intentionally_disabled,
+#                         input_boolean.mow_yard_active, sensor.<mower>_battery,
+#                         lawn_mower.<mower>
+#   - Orchestration tier:  script.mow_the_front_yard / mow_the_backyard /
+#                          mow_the_yard / mower_cancel_and_dock
+#
+# ⚠️  RESTART REQUIRED: intent_script: has NO hot reload. After editing this
+#     file you MUST fully restart Home Assistant for changes to take effect.
+#     (The sentences file voice/intents/mower.yaml DOES hot-reload — only the
+#     handlers here need a restart.)
+#
+# ── ENTITY NAMING ──────────────────────────────────────────────────────────
+# `luba_3` is the entity slug the Mammotion integration derived from OUR
+# mower's device name (a Mammotion Luba 3). Yours will differ. Replace every
+# `luba_3` below (sensor.luba_3_battery, lawn_mower.luba_3) with your own
+# mower's slug — check Developer Tools → States.
+#
+# ── TWO DESIGN PRINCIPLES WORTH BORROWING ──────────────────────────────────
+# (a) The immediate spoken REPLY (speech.text here) is SEPARATE from any
+#     background ANNOUNCEMENT. The reply is the quick "got it" the satellite
+#     speaks right now. Longer progress announcements ("front yard finished")
+#     are the orchestration scripts' job, and should route through your own
+#     quiet-hours / Do-Not-Disturb gate so they stay silent at night while the
+#     notification still posts. See voice/README.md.
+# (b) speech and action read the SAME composite-busy check, so the spoken
+#     reply never contradicts what the action actually does.
+#
+# ── SATELLITE ROUTING (optional, wire it however you like) ─────────────────
+# In our setup the mow scripts speak their finish announcement back on the
+# SAME satellite the command came from. To make that possible, each handler
+# stashes the triggering satellite into a helper (input_text.mower_source_
+# satellite) that the orchestration script reads later.
+#   * This is 100% OPTIONAL. If you do not care which speaker replies, delete
+#     the `source_satellite` variable block and the input_text.set_value step.
+#   * The resolution template below is one pattern that worked for us: prefer
+#     the satellite on the triggering device, else the first non-idle
+#     satellite, else a hard-coded default. Replace
+#     assist_satellite.YOUR_DEFAULT_SATELLITE with one of your own satellites,
+#     or swap the whole template for your own logic.
+#   * Create the helper if you use it:
+#       input_text:
+#         mower_source_satellite:
+#           name: Mower source satellite
+# ============================================================================
+
+
+# ── shared note ─────────────────────────────────────────────────────────────
+# The composite-busy check appears in every handler and is intentionally
+# identical between speech and action. `just_started` treats a mow that began
+# in the last 15s as "still starting" rather than "already in progress" — this
+# avoids a contradictory second reply when a wake word double-fires or a
+# speaker echo retriggers the pipeline.
+
+
+MowFrontYard:
+  speech:
+    text: >-
+      {% set just_started = is_state('input_boolean.mow_yard_active','on')
+         and states.input_boolean.mow_yard_active.last_changed is not none
+         and (now() - states.input_boolean.mow_yard_active.last_changed).total_seconds() < 15 %}
+      {% set busy = (is_state('input_boolean.mow_yard_active','on') and not just_started)
+         or is_state('script.mow_the_front_yard','on')
+         or is_state('script.mow_the_backyard','on')
+         or is_state('script.mow_the_yard','on')
+         or states('sensor.mower_status') in ['mowing','returning','paused'] %}
+      {% set battery = states('sensor.luba_3_battery') | int(0) %}
+      {% set state = states('lawn_mower.luba_3') %}
+      {% set integration_disabled = is_state('input_boolean.mammotion_intentionally_disabled','on') %}
+      {% set integration_unhealthy = is_state('binary_sensor.mammotion_integration_healthy','off') %}
+      {% if just_started %}
+        Mowing is starting.
+      {% elif busy %}
+        Mow already in progress. Say cancel to stop.
+      {% elif battery < 70 %}
+        Battery at {{ battery }} percent. Minimum is 70.
+      {% elif integration_disabled %}
+        Enabling integration.
+      {% elif integration_unhealthy %}
+        Reloading integration.
+      {# OPTIONAL gate check — only if a zone of yours is behind a gate. Delete
+         this elif (and the binary_sensor.gate entity) if you have no gate. #}
+      {% elif is_state('binary_sensor.gate','off') %}
+        Gate closed. Open it within five minutes.
+      {% elif state in ['unavailable', 'unknown', 'none', ''] %}
+        Mower offline. Try again shortly.
+      {% else %}
+        Starting front yard.
+      {% endif %}
+  action:
+    # OPTIONAL satellite routing — delete this block if you don't reply on the
+    # triggering speaker. See file header.
+    - variables:
+        source_satellite: >-
+          {% set sd = device_id if (device_id is defined and device_id is string) else '' %}
+          {% if sd %}
+            {% set sats = device_entities(sd) | select('match', '^assist_satellite\\.') | list %}
+            {% if sats %}{{ sats[0] }}{% else %}assist_satellite.YOUR_DEFAULT_SATELLITE{% endif %}
+          {% else %}
+            {% set active = states.assist_satellite | rejectattr('state', 'eq', 'idle') | list %}
+            {% if active %}{{ active[0].entity_id }}{% else %}assist_satellite.YOUR_DEFAULT_SATELLITE{% endif %}
+          {% endif %}
+    # Same composite-busy check as speech — they must agree so we never fire
+    # while something else is already running.
+    - if:
+      - condition: template
+        value_template: >-
+          {{ not (is_state('input_boolean.mow_yard_active','on')
+             or is_state('script.mow_the_front_yard','on')
+             or is_state('script.mow_the_backyard','on')
+             or is_state('script.mow_the_yard','on')
+             or states('sensor.mower_status') in ['starting','mowing','returning','paused']) }}
+      then:
+      # OPTIONAL: stash the triggering satellite for the orchestration script
+      # to announce back on. Delete if you removed the variable above.
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.mower_source_satellite
+        data:
+          value: "{{ source_satellite }}"
+      # Hand off to the orchestration tier. This is the only required step.
+      - action: script.turn_on
+        target:
+          entity_id: script.mow_the_front_yard
+
+
+MowBackyard:
+  speech:
+    text: >-
+      {% set just_started = is_state('input_boolean.mow_yard_active','on')
+         and states.input_boolean.mow_yard_active.last_changed is not none
+         and (now() - states.input_boolean.mow_yard_active.last_changed).total_seconds() < 15 %}
+      {% set busy = (is_state('input_boolean.mow_yard_active','on') and not just_started)
+         or is_state('script.mow_the_front_yard','on')
+         or is_state('script.mow_the_backyard','on')
+         or is_state('script.mow_the_yard','on')
+         or states('sensor.mower_status') in ['mowing','returning','paused'] %}
+      {% set battery = states('sensor.luba_3_battery') | int(0) %}
+      {% set state = states('lawn_mower.luba_3') %}
+      {% set integration_disabled = is_state('input_boolean.mammotion_intentionally_disabled','on') %}
+      {% set integration_unhealthy = is_state('binary_sensor.mammotion_integration_healthy','off') %}
+      {% if just_started %}
+        Mowing is starting.
+      {% elif busy %}
+        Mow already in progress. Say cancel to stop.
+      {% elif battery < 70 %}
+        Battery at {{ battery }} percent. Minimum is 70.
+      {% elif integration_disabled %}
+        Enabling integration.
+      {% elif integration_unhealthy %}
+        Reloading integration.
+      {% elif state in ['unavailable', 'unknown', 'none', ''] %}
+        Mower offline. Try again shortly.
+      {% else %}
+        Starting backyard.
+      {% endif %}
+  action:
+    - variables:
+        source_satellite: >-
+          {% set sd = device_id if (device_id is defined and device_id is string) else '' %}
+          {% if sd %}
+            {% set sats = device_entities(sd) | select('match', '^assist_satellite\\.') | list %}
+            {% if sats %}{{ sats[0] }}{% else %}assist_satellite.YOUR_DEFAULT_SATELLITE{% endif %}
+          {% else %}
+            {% set active = states.assist_satellite | rejectattr('state', 'eq', 'idle') | list %}
+            {% if active %}{{ active[0].entity_id }}{% else %}assist_satellite.YOUR_DEFAULT_SATELLITE{% endif %}
+          {% endif %}
+    - if:
+      - condition: template
+        value_template: >-
+          {{ not (is_state('input_boolean.mow_yard_active','on')
+             or is_state('script.mow_the_front_yard','on')
+             or is_state('script.mow_the_backyard','on')
+             or is_state('script.mow_the_yard','on')
+             or states('sensor.mower_status') in ['starting','mowing','returning','paused']) }}
+      then:
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.mower_source_satellite
+        data:
+          value: "{{ source_satellite }}"
+      - action: script.turn_on
+        target:
+          entity_id: script.mow_the_backyard
+
+
+MowAllLawns:
+  speech:
+    text: >-
+      {% set just_started = is_state('input_boolean.mow_yard_active','on')
+         and states.input_boolean.mow_yard_active.last_changed is not none
+         and (now() - states.input_boolean.mow_yard_active.last_changed).total_seconds() < 15 %}
+      {% set busy = (is_state('input_boolean.mow_yard_active','on') and not just_started)
+         or is_state('script.mow_the_front_yard','on')
+         or is_state('script.mow_the_backyard','on')
+         or is_state('script.mow_the_yard','on')
+         or states('sensor.mower_status') in ['mowing','returning','paused'] %}
+      {% set battery = states('sensor.luba_3_battery') | int(0) %}
+      {% set state = states('lawn_mower.luba_3') %}
+      {% set integration_disabled = is_state('input_boolean.mammotion_intentionally_disabled','on') %}
+      {% set integration_unhealthy = is_state('binary_sensor.mammotion_integration_healthy','off') %}
+      {% if just_started %}
+        Mowing all lawns is starting.
+      {% elif busy %}
+        Mow already in progress. Say cancel to stop.
+      {% elif battery < 70 %}
+        Battery at {{ battery }} percent. Minimum is 70.
+      {% elif integration_disabled %}
+        Enabling integration.
+      {% elif integration_unhealthy %}
+        Reloading integration.
+      {% elif state in ['unavailable', 'unknown', 'none', ''] %}
+        Mower offline. Try again shortly.
+      {% else %}
+        Starting all lawns.
+      {% endif %}
+  action:
+    - variables:
+        source_satellite: >-
+          {% set sd = device_id if (device_id is defined and device_id is string) else '' %}
+          {% if sd %}
+            {% set sats = device_entities(sd) | select('match', '^assist_satellite\\.') | list %}
+            {% if sats %}{{ sats[0] }}{% else %}assist_satellite.YOUR_DEFAULT_SATELLITE{% endif %}
+          {% else %}
+            {% set active = states.assist_satellite | rejectattr('state', 'eq', 'idle') | list %}
+            {% if active %}{{ active[0].entity_id }}{% else %}assist_satellite.YOUR_DEFAULT_SATELLITE{% endif %}
+          {% endif %}
+    - if:
+      - condition: template
+        value_template: >-
+          {{ not (is_state('input_boolean.mow_yard_active','on')
+             or is_state('script.mow_the_front_yard','on')
+             or is_state('script.mow_the_backyard','on')
+             or is_state('script.mow_the_yard','on')
+             or states('sensor.mower_status') in ['starting','mowing','returning','paused']) }}
+      then:
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.mower_source_satellite
+        data:
+          value: "{{ source_satellite }}"
+      - action: script.turn_on
+        target:
+          entity_id: script.mow_the_yard
+
+
+CancelMowing:
+  speech:
+    text: >-
+      {% set running = is_state('script.mow_the_front_yard','on')
+         or is_state('script.mow_the_backyard','on')
+         or is_state('script.mow_the_yard','on')
+         or is_state('input_boolean.mow_yard_active','on')
+         or states('lawn_mower.luba_3') in ['mowing','returning','paused'] %}
+      {% if running %}
+        Canceling the mow.
+      {% else %}
+        Not currently mowing.
+      {% endif %}
+  action:
+    - if:
+      - condition: template
+        value_template: >-
+          {{ is_state('script.mow_the_front_yard','on')
+             or is_state('script.mow_the_backyard','on')
+             or is_state('script.mow_the_yard','on')
+             or is_state('input_boolean.mow_yard_active','on')
+             or states('lawn_mower.luba_3') in ['mowing','returning','paused'] }}
+      then:
+      - action: script.turn_on
+        target:
+          entity_id: script.mower_cancel_and_dock

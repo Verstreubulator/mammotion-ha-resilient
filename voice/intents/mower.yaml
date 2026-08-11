@@ -1,0 +1,63 @@
+# ============================================================================
+# OPTIONAL VOICE LAYER — Assist sentence triggers for mower control
+# ============================================================================
+# This is the sentence-trigger half of the optional voice add-on. It maps
+# spoken phrases to intent NAMES. The matching intent handlers (the spoken
+# replies + the calls into your orchestration scripts) live in
+# ../intent_scripts.yaml.
+#
+# FORMAT: flat mapping of  IntentName: [list of sentences]  — this is the shape
+# our Assist config reads (referenced from configuration.yaml, see README).
+# Keep it flat; do not nest under language:/intents:/data: for this style.
+#
+# WHAT THIS DEPENDS ON (nothing here works without the lower tiers):
+#   - Core status tier:   sensor.mower_status, binary_sensor.mammotion_*
+#   - Orchestration tier:  script.mow_the_front_yard / mow_the_backyard /
+#                          mow_the_yard / mower_cancel_and_dock
+# The core + orchestration tiers run perfectly with NO voice at all. This
+# layer only adds hands-free convenience on top.
+#
+# INSTALL: point your intents include at this file (see voice/README.md).
+#   This sentences file reloads without a restart (Developer Tools → YAML →
+#   "Reload custom sentences" / conversation reload). BUT the intent HANDLERS
+#   in ../intent_scripts.yaml require a full HA RESTART — intent_script: has
+#   no hot reload.
+#
+# CUSTOMIZE:
+#   - Brackets [the] / [send] make those words OPTIONAL, so one pattern covers
+#     several phrasings (e.g. "mow [the] front yard" matches "mow front yard",
+#     "mow the front yard", "mow front", and "mow the front").
+#   - "front yard" / "backyard" are just the two lawn zones we happened to
+#     have. Rename them to match your own zones and the orchestration scripts
+#     they map to.
+# ============================================================================
+
+MowFrontYard:
+  - "mow [the] front yard"
+  - "mow [the] front lawn"
+  - "mow [the] front"
+
+MowBackyard:
+  - "mow [the] backyard"
+  - "mow [the] back yard"
+  - "mow [the] back lawn"
+  - "mow [the] back"
+
+MowAllLawns:
+  - "mow all [the] lawns"
+  - "mow [the] yard"
+  - "mow [the] lawns"
+  - "mow both yards"
+  - "mow both [the] lawns"
+
+CancelMowing:
+  - "cancel [the] mow"
+  - "cancel [the] mowing"
+  - "stop [the] mow"
+  - "stop [the] mowing"
+  - "stop the mower"
+  - "cancel the mower"
+  - "dock the mower"
+  - "[send] [the] mower [back] [to] [the] dock"
+  - "abort [the] mow"
+  - "abort [the] mowing"

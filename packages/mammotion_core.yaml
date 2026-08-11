@@ -1,0 +1,579 @@
+# =============================================================================
+# mammotion_core.yaml — the reliability CORE for a Mammotion mower in Home Assistant
+# =============================================================================
+# This is a voice-free, orchestration-free reliability layer we run on top of the
+# community Mammotion integration. It gives you:
+#   * stable zone-switch display proxies that survive the integration re-numbering
+#     its area/zone switch entity_ids on every map sync (issue #604);
+#   * a small stack of debounced health/status sensors that turn the integration's
+#     raw (and occasionally flappy) telemetry into steady, human-readable signals;
+#   * a self-contained integration-recovery routine (reload / optional enable) plus
+#     the helpers it needs.
+#
+# HUGE thanks to the maintainers and contributors of the community integration
+# `mikey0000/Mammotion-HA` and the underlying `pymammotion` library. Everything
+# here is built ON TOP of their work — none of it would exist without them. The
+# Mammotion protocol is closed and keeps changing, so rough edges in a free
+# community integration are expected and completely understandable. Nothing below
+# is a criticism of that project; these are just userspace patterns that worked
+# for us to smooth over a few of those edges.
+#
+# -----------------------------------------------------------------------------
+# WHAT WE RUN (for reference — not a requirement, and NOT a recommendation about
+# which version you should use):
+#   * `mikey0000/Mammotion-HA` 0.6.4-beta9, `pymammotion` 0.8.11
+#   * Mower: Mammotion Luba 3   * HA: current 2026.x
+#   In our experience the beta9 -> beta11 delta is tiny and does not change the
+#   zone-switch churn, so we pin beta9 while actively editing maps. That's our
+#   situation, not advice — use whatever version works for you.
+#
+# -----------------------------------------------------------------------------
+# DEPENDENCIES
+#   * The Mammotion integration installed and a mower added.
+#   * A mower entity. Ours enumerates as `lawn_mower.luba_3` because our mower's
+#     device name is "Luba 3" — the `luba_3` slug is derived from the device name.
+#     YOURS WILL DIFFER (e.g. `lawn_mower.luba_2`, `lawn_mower.yuka`). Do a
+#     find-and-replace of `luba_3` throughout this file with your own mower's slug.
+#     The integration-provided entities this file reads are:
+#       lawn_mower.luba_3, sensor.luba_3_battery,
+#       sensor.luba_3_activity_mode, sensor.luba_3_last_error
+#   * The recovery script optionally calls `homeassistant.enable_config_entry`,
+#     which requires the Spook add-on/integration (see the SECRET + RECOVERY notes
+#     below). `homeassistant.reload_config_entry` is HA core — no add-on needed.
+#
+# -----------------------------------------------------------------------------
+# SECRET — config_entry_id (only needed by the recovery script)
+#   The recovery script reloads (and optionally enables) the Mammotion config
+#   entry by id, kept out of this file via `!secret mammotion_config_entry_id`.
+#   To find the id:
+#     1. Settings -> Devices & Services -> Mammotion -> the 3-dot menu, or
+#     2. open the integration page and copy the long hex id from the URL
+#        (…/config/integrations/integration/mammotion -> click the entry;
+#        the URL becomes …/config_entry/<THIS_IS_THE_ID>), or
+#     3. read `.storage/core.config_entries` and find the mammotion entry's
+#        "entry_id".
+#   Then add to secrets.yaml:
+#       mammotion_config_entry_id: "abcdef0123456789abcdef0123456789"
+#   If you never use the recovery script you can delete SECTION 5 and skip this.
+#
+# -----------------------------------------------------------------------------
+# INSTALL
+#   1. Make sure packages are enabled in configuration.yaml:
+#        homeassistant:
+#          packages: !include_dir_named packages
+#   2. Drop this file in config/packages/.
+#   3. Replace the `luba_3` slug with your mower's slug (see DEPENDENCIES).
+#   4. Edit the zone-name substrings in SECTION 1 to match your zones.
+#   5. If using the recovery script, add mammotion_config_entry_id to secrets.yaml.
+#   6. Check config (Developer Tools -> YAML -> Check Configuration) and restart HA.
+#
+# RELOAD
+#   * template: sensors here -> Developer Tools -> Actions -> template.reload
+#     (or the "Template entities" reload button) — no restart.
+#   * input_* helpers and script: -> "Input *" / "Scripts" reload buttons, or a
+#     full restart. New helpers/scripts sometimes need a restart to register.
+# =============================================================================
+
+
+# =============================================================================
+# SECTION 1: Zone DISPLAY proxies (stable names) — workaround for issue #604
+# =============================================================================
+# In our experience the Mammotion integration re-enumerates the area/zone switch
+# entity_ids on every map sync / area recreation (new numeric suffixes; the old
+# ids orphan to `unavailable`). That's an understandable consequence of syncing a
+# closed, changing mower map — but it means hardcoding those ids in a dashboard
+# breaks on every remap (see upstream issue #604).
+#
+# These READ-ONLY template binary_sensors resolve the CURRENT available zone
+# switch the same way our mow logic does — match by an entity_id SUBSTRING, filter
+# to the available ones (`on`/`off`) — and mirror that switch's state. Point your
+# dashboard "Lawn Areas" card at THESE stable names and it survives future remaps.
+#
+# DISPLAY-ONLY: these are sensors, not switches — there is nothing to toggle from
+# the dashboard here. Actual zone selection happens by setting the real integration
+# zone switches (e.g. in your own mow scripts).
+#
+# `availability` = "a live zone switch exists": when a zone is truly gone or
+# mid-remap the proxy reports `unavailable` (honest) rather than a false `off`.
+#
+# >>> EDIT ME <<<  Replace the search substrings below (`area_back_lawn`,
+# `area_front_lawn_w`, `area_front_lawn_e`) with YOUR zone/area name fragments as
+# they appear in your switch entity_ids. Look under Developer Tools -> States,
+# filter on `switch.` and your mower name, and pick a stable, unique substring of
+# each zone's entity_id (the human-named part, not the churning numeric suffix).
+# Add or remove blocks to match how many zones you have.
+# =============================================================================
+template:
+  - binary_sensor:
+      - name: "Mow Area Back Lawn"
+        unique_id: mow_area_back_lawn
+        icon: mdi:grass
+        availability: >
+          {{ states.switch
+             | selectattr('entity_id', 'search', 'area_back_lawn')
+             | selectattr('state', 'in', ['on', 'off']) | list | count > 0 }}
+        state: >
+          {% set m = states.switch
+             | selectattr('entity_id', 'search', 'area_back_lawn')
+             | selectattr('state', 'in', ['on', 'off'])
+             | map(attribute='entity_id') | list %}
+          {{ is_state(m[0], 'on') if m else false }}
+        attributes:
+          resolved_entity: >
+            {% set m = states.switch
+               | selectattr('entity_id', 'search', 'area_back_lawn')
+               | selectattr('state', 'in', ['on', 'off'])
+               | map(attribute='entity_id') | list %}
+            {{ m[0] if m else '' }}
+
+      - name: "Mow Area Front Lawn W"
+        unique_id: mow_area_front_lawn_w
+        icon: mdi:grass
+        availability: >
+          {{ states.switch
+             | selectattr('entity_id', 'search', 'area_front_lawn_w')
+             | selectattr('state', 'in', ['on', 'off']) | list | count > 0 }}
+        state: >
+          {% set m = states.switch
+             | selectattr('entity_id', 'search', 'area_front_lawn_w')
+             | selectattr('state', 'in', ['on', 'off'])
+             | map(attribute='entity_id') | list %}
+          {{ is_state(m[0], 'on') if m else false }}
+        attributes:
+          resolved_entity: >
+            {% set m = states.switch
+               | selectattr('entity_id', 'search', 'area_front_lawn_w')
+               | selectattr('state', 'in', ['on', 'off'])
+               | map(attribute='entity_id') | list %}
+            {{ m[0] if m else '' }}
+
+      - name: "Mow Area Front Lawn E"
+        unique_id: mow_area_front_lawn_e
+        icon: mdi:grass
+        availability: >
+          {{ states.switch
+             | selectattr('entity_id', 'search', 'area_front_lawn_e')
+             | selectattr('state', 'in', ['on', 'off']) | list | count > 0 }}
+        state: >
+          {% set m = states.switch
+             | selectattr('entity_id', 'search', 'area_front_lawn_e')
+             | selectattr('state', 'in', ['on', 'off'])
+             | map(attribute='entity_id') | list %}
+          {{ is_state(m[0], 'on') if m else false }}
+        attributes:
+          resolved_entity: >
+            {% set m = states.switch
+               | selectattr('entity_id', 'search', 'area_front_lawn_e')
+               | selectattr('state', 'in', ['on', 'off'])
+               | map(attribute='entity_id') | list %}
+            {{ m[0] if m else '' }}
+
+  # ===========================================================================
+  # SECTION 2: Health / status sensor stack
+  # ===========================================================================
+  # These turn the integration's raw telemetry into steady signals. Each is
+  # debounced so brief blips (common with a BLE/Wi-Fi mower) don't flap them.
+  # ---------------------------------------------------------------------------
+  - binary_sensor:
+      # -----------------------------------------------------------------------
+      # Mower Charged — "ready for the NEXT task."
+      # Simple, self-contained version: docked AND battery >= 80%, held for 5 min
+      # via delay_on so a momentary docked/battery flap doesn't latch it early.
+      #
+      # NOTE (our setup): the firmware/pymammotion combo on our Luba 3 flaps the
+      # battery/docked telemetry, and that flapping kept resetting a plain delay_on
+      # clock, so in our private config we drive this from a smart-plug standby-
+      # wattage reading instead (docked + plug in its standby band = charge done,
+      # immune to the flap). That needs extra hardware/entities, so it is NOT in
+      # this generic core. If you see this sensor never latching, look at your
+      # battery/docked telemetry for flapping and consider a plug-based approach.
+      # -----------------------------------------------------------------------
+      - name: "Mower Charged"
+        unique_id: mower_charged
+        icon: mdi:battery-charging-high
+        delay_on: "00:05:00"
+        state: >
+          {{ is_state('lawn_mower.luba_3', 'docked')
+             and states('sensor.luba_3_battery') | int(0) >= 80 }}
+
+      # -----------------------------------------------------------------------
+      # Mower Charging — "previous task complete / mower is home." A robovac-style
+      # latch on the DOCKED state (we found the integration's own charging sensor
+      # reads OFF at 100% on our mower, so we don't use it here). ON the whole time
+      # it's home; its ON-edge marks a zone/task just completing. Drops ~10 s after
+      # it leaves for the next task. Debounced 10 s each way.
+      # -----------------------------------------------------------------------
+      - name: "Mower Charging"
+        unique_id: mower_charging
+        icon: mdi:home-import-outline
+        delay_on: "00:00:10"
+        delay_off: "00:00:10"
+        state: "{{ is_state('lawn_mower.luba_3', 'docked') }}"
+
+      # -----------------------------------------------------------------------
+      # Mammotion Integration Healthy — the boolean GATE to test before commanding
+      # the mower. ON only when the core mower entity AND all the zone control
+      # switches (resolved via the stable proxies in SECTION 1) are available —
+      # this catches the "sensors up but zone controls gone" failure that a plain
+      # `unavailable` check on the mower entity alone would miss. Debounced so
+      # brief blips don't flap it (slower to trust up, quicker to drop).
+      #
+      # EDIT ME: list the SECTION 1 zone proxies you actually defined. If you have
+      # a different number of zones, add/remove the lines to match.
+      # -----------------------------------------------------------------------
+      - name: "Mammotion Integration Healthy"
+        unique_id: mammotion_integration_healthy
+        icon: mdi:lan-connect
+        delay_on: "00:00:15"
+        delay_off: "00:00:10"
+        state: >
+          {% set core = states('lawn_mower.luba_3') not in ['unavailable','unknown','none'] %}
+          {{ core
+             and states('binary_sensor.mow_area_back_lawn') in ['on','off']
+             and states('binary_sensor.mow_area_front_lawn_w') in ['on','off']
+             and states('binary_sensor.mow_area_front_lawn_e') in ['on','off'] }}
+
+      # -----------------------------------------------------------------------
+      # Lawn Mower Active — a single boolean meaning "the mower is busy / off its
+      # dock." We expose it as the "clear to water" interlock our irrigation reads
+      # (a sprinkler zone waits for this to be OFF), but that consumer is entirely
+      # OPTIONAL — nothing in this core file depends on it, so keep it only if a
+      # sprinkler/irrigation setup (or anything else) wants to know the mower is
+      # out. delay_off rides out brief end-of-run blips so it doesn't flap
+      # busy -> clear -> busy.
+      #
+      # This CORE version tracks only the device state. If you also run a mow-
+      # orchestration layer (mow scripts + a "mow active" input_boolean), you can
+      # OR those in so the signal also covers the charge-wait gaps between yards —
+      # see the commented lines. Left out here to keep the core orchestration-free.
+      # -----------------------------------------------------------------------
+      - name: "Lawn Mower Active"
+        unique_id: lawn_mower_active
+        device_class: running
+        icon: mdi:robot-mower
+        delay_off: "00:01:00"
+        state: >
+          {{ states('lawn_mower.luba_3') in ['mowing','returning','docking','paused'] }}
+          {# optional, if you run the orchestration tier, OR-in your own signals:
+             or is_state('input_boolean.mow_yard_active','on')
+             or is_state('script.mow_the_front_yard','on')
+             or is_state('script.mow_the_backyard','on')
+             or is_state('script.mow_the_yard','on') #}
+
+  # -------------------------------------------------------------------------
+  # Mammotion Integration Status — a friendly one-word status string, driven by
+  # the health boolean plus the recovery phase (SECTION 4/5). This is what a
+  # dashboard chip/card shows the household. Trigger-based so it re-evaluates on
+  # the relevant changes and on HA start.
+  # -------------------------------------------------------------------------
+  - trigger:
+      - trigger: state
+        entity_id:
+          - binary_sensor.mammotion_integration_healthy
+          - input_select.mammotion_recovery_phase
+          - lawn_mower.luba_3
+      - trigger: homeassistant
+        event: start
+    sensor:
+      - name: "Mammotion Integration Status"
+        unique_id: mammotion_integration_status
+        icon: mdi:robot-mower
+        state: >
+          {% set ph = states('input_select.mammotion_recovery_phase') %}
+          {% if is_state('binary_sensor.mammotion_integration_healthy','on') %}Ready
+          {% elif ph == 'enabling' %}Enabling
+          {% elif ph == 'reloading' %}Reloading
+          {% elif ph == 'reconnecting' %}Reconnecting
+          {% elif ph == 'failed' %}Recovery Failed
+          {% elif states('lawn_mower.luba_3') in ['unavailable','unknown','none'] %}Offline
+          {% else %}Not Ready{% endif %}
+        attributes:
+          attempt: "{{ states('input_number.mammotion_recovery_attempt') | int(0) }}"
+
+  # -------------------------------------------------------------------------
+  # Mower Status (multi-state) — the authoritative "what is the mower doing"
+  # string, built on the more reliable signals (MODE_WORKING for real mowing, the
+  # debounced trackers above, integration_healthy for offline/reconnecting).
+  # Priority-ordered; trigger-based with a 10 s debounce so integration blips and
+  # pre-roll don't flap it.
+  #
+  # The `current_zone` attribute maps the SECTION 1 zone proxies to a human name.
+  # EDIT ME to match your zones (or drop the attribute if you don't need it).
+  # -------------------------------------------------------------------------
+  - trigger:
+      - trigger: state
+        entity_id:
+          - lawn_mower.luba_3
+          - sensor.luba_3_activity_mode
+          - binary_sensor.mammotion_integration_healthy
+          - binary_sensor.mower_charged
+          - binary_sensor.mower_charging
+        for: "00:00:10"
+      - trigger: homeassistant
+        event: start
+    sensor:
+      - name: "Mower Status"
+        unique_id: mower_status
+        icon: mdi:robot-mower
+        state: >
+          {% set s = states('lawn_mower.luba_3') %}
+          {% set err = states('sensor.luba_3_last_error') | lower %}
+          {% if s in ['unavailable','unknown','none'] %}offline
+          {% elif is_state('binary_sensor.mammotion_integration_healthy','off') %}reconnecting
+          {% elif s == 'error' and ('stuck' in err or 'trap' in err) %}stuck
+          {% elif s == 'error' %}error
+          {% elif s == 'paused' %}paused
+          {% elif s in ['returning','docking'] %}returning
+          {% elif s == 'mowing' and states('sensor.luba_3_activity_mode') != 'MODE_WORKING' %}starting
+          {% elif s == 'mowing' %}mowing
+          {% elif is_state('binary_sensor.mower_charged','on') %}ready
+          {% elif s == 'docked' %}charging
+          {% else %}{{ s }}{% endif %}
+        attributes:
+          current_zone: >
+            {% if is_state('binary_sensor.mow_area_back_lawn','on') %}back lawn
+            {% elif is_state('binary_sensor.mow_area_front_lawn_w','on') or is_state('binary_sensor.mow_area_front_lawn_e','on') %}front lawn
+            {% else %}none{% endif %}
+          battery: "{{ states('sensor.luba_3_battery') | int(0) }}"
+          reason: "{{ states('sensor.luba_3_last_error') }}"
+
+
+# =============================================================================
+# SECTION 3: Recovery helpers — attempt counter
+# =============================================================================
+# Bumped by script.mower_recover_integration; surfaced on
+# sensor.mammotion_integration_status as the `attempt` attribute.
+input_number:
+  mammotion_recovery_attempt:
+    name: Mammotion Recovery Attempt
+    icon: mdi:counter
+    min: 0
+    max: 99
+    step: 1
+    mode: box
+
+
+# =============================================================================
+# SECTION 4: Recovery helpers — phase + intentional-disable flag
+# =============================================================================
+input_select:
+  # Recovery progress — set by script.mower_recover_integration; drives
+  # sensor.mammotion_integration_status. Reset to idle on success / HA start.
+  mammotion_recovery_phase:
+    name: Mammotion Recovery Phase
+    icon: mdi:progress-wrench
+    options:
+      - idle
+      - enabling
+      - reloading
+      - reconnecting
+      - failed
+
+input_boolean:
+  # Set ON only when YOU intentionally disable the Mammotion config entry to hand
+  # the mower to the phone app for a while (so the recovery script knows to ENABLE
+  # it rather than just reload). Leave OFF for normal operation. If you never
+  # disable the integration for phone control, you can ignore this flag entirely.
+  mammotion_intentionally_disabled:
+    name: Mammotion Intentionally Disabled
+    icon: mdi:cellphone-link
+
+
+# =============================================================================
+# SECTION 5: Integration-recovery script
+# =============================================================================
+# A standalone, callable recovery routine. Call it (e.g. from an automation that
+# watches for the integration going unhealthy) and it will try to bring the
+# Mammotion integration back with a hard cap of TWO server touches — deliberately
+# conservative to avoid any risk of a Mammotion cloud lockout.
+#
+# In our experience the reload IS the recovery: a `reload_config_entry` almost
+# always brings the controls back within ~a minute. Sync-Maps never helped us, so
+# it's not here. Two paths:
+#   Path A — you had intentionally disabled the entry (phone-control mode, the
+#            input_boolean above is ON): ENABLE it, then optionally reload once.
+#            The enable step uses `homeassistant.enable_config_entry`, which is
+#            provided by the Spook add-on/integration — OPTIONAL, and only needed
+#            for this "re-enable after intentional disable" path. If you never
+#            disable the integration, you don't need Spook: delete the Path A
+#            `choose` branch and keep only the reload path (Path B).
+#   Path B — the entry was enabled but unhealthy (controls dropped): reload once,
+#            then optionally reload again. `homeassistant.reload_config_entry` is
+#            HA core — no add-on required.
+#
+# It publishes progress to input_select.mammotion_recovery_phase (which drives
+# sensor.mammotion_integration_status) and bumps input_number.mammotion_recovery_
+# attempt. It does NOT notify or announce — the caller checks
+# binary_sensor.mammotion_integration_healthy afterward and decides what to do.
+#
+# Needs `!secret mammotion_config_entry_id` in secrets.yaml (see the header).
+# =============================================================================
+script:
+  mower_recover_integration:
+    alias: Mower — Recover Integration
+    icon: mdi:autorenew
+    mode: single
+    description: >-
+      Standalone integration-recovery routine — callable from any automation or
+      script. Branches on input_boolean.mammotion_intentionally_disabled. Path A:
+      enable (Spook) + optional reload. Path B: reload + optional reload retry.
+      Publishes progress to input_select.mammotion_recovery_phase and bumps the
+      attempt counter. Hard cap of 2 server touches. Does not announce or clean
+      up — the caller checks binary_sensor.mammotion_integration_healthy after.
+    sequence:
+      # Already healthy → nothing to do.
+      - if:
+          - condition: state
+            entity_id: binary_sensor.mammotion_integration_healthy
+            state: 'on'
+        then:
+          - action: input_select.select_option
+            target:
+              entity_id: input_select.mammotion_recovery_phase
+            data:
+              option: idle
+          - action: input_number.set_value
+            target:
+              entity_id: input_number.mammotion_recovery_attempt
+            data:
+              value: 0
+          - stop: Already healthy
+      # New recovery attempt — bump the counter.
+      - action: input_number.set_value
+        target:
+          entity_id: input_number.mammotion_recovery_attempt
+        data:
+          value: "{{ (states('input_number.mammotion_recovery_attempt') | int(0)) + 1 }}"
+      # Decide path based on the intentionally-disabled flag.
+      - choose:
+          # ================================================================
+          # PATH A — was intentionally disabled (phone-control mode).
+          # Touch 1: enable (Spook). Touch 2 (only if needed): reload.
+          # Clears the disabled flag after the enable.
+          # NOTE: homeassistant.enable_config_entry needs the Spook add-on.
+          # If you never disable the integration, delete this whole branch.
+          # ================================================================
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.mammotion_intentionally_disabled
+                state: 'on'
+            sequence:
+              - action: input_select.select_option
+                target:
+                  entity_id: input_select.mammotion_recovery_phase
+                data:
+                  option: enabling
+              # Touch 1 — enable via Spook (OPTIONAL: requires the Spook add-on).
+              - action: homeassistant.enable_config_entry
+                data:
+                  config_entry_id: !secret mammotion_config_entry_id
+              # Clear the intentional-disable flag now that we've enabled.
+              - action: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.mammotion_intentionally_disabled
+              - wait_template: "{{ states('sensor.luba_3_activity_mode') not in ['unavailable','unknown','none',''] }}"
+                timeout: '00:03:00'
+                continue_on_timeout: true
+              - wait_template: "{{ is_state('binary_sensor.mammotion_integration_healthy','on') }}"
+                timeout: '00:02:00'
+                continue_on_timeout: true
+              # Healthy after enable? → done. Otherwise one reload.
+              - if:
+                  - condition: state
+                    entity_id: binary_sensor.mammotion_integration_healthy
+                    state: 'off'
+                then:
+                  # Touch 2 — fall back to a single reload.
+                  - action: input_select.select_option
+                    target:
+                      entity_id: input_select.mammotion_recovery_phase
+                    data:
+                      option: reloading
+                  - action: homeassistant.reload_config_entry
+                    data:
+                      entry_id: !secret mammotion_config_entry_id
+                  - wait_template: "{{ states('sensor.luba_3_activity_mode') not in ['unavailable','unknown','none',''] }}"
+                    timeout: '00:03:00'
+                    continue_on_timeout: true
+                  - action: input_select.select_option
+                    target:
+                      entity_id: input_select.mammotion_recovery_phase
+                    data:
+                      option: reconnecting
+                  - wait_template: "{{ is_state('binary_sensor.mammotion_integration_healthy','on') }}"
+                    timeout: '00:02:00'
+                    continue_on_timeout: true
+        # ====================================================================
+        # PATH B — was enabled but unhealthy (controls dropped — the common
+        # case). Touch 1: reload. Touch 2 (only if needed): reload retry.
+        # reload_config_entry is HA core — no add-on required.
+        # ====================================================================
+        default:
+          - action: input_select.select_option
+            target:
+              entity_id: input_select.mammotion_recovery_phase
+            data:
+              option: reloading
+          # Touch 1 — first reload attempt.
+          - action: homeassistant.reload_config_entry
+            data:
+              entry_id: !secret mammotion_config_entry_id
+          - wait_template: "{{ states('sensor.luba_3_activity_mode') not in ['unavailable','unknown','none',''] }}"
+            timeout: '00:03:00'
+            continue_on_timeout: true
+          - action: input_select.select_option
+            target:
+              entity_id: input_select.mammotion_recovery_phase
+            data:
+              option: reconnecting
+          - wait_template: "{{ is_state('binary_sensor.mammotion_integration_healthy','on') }}"
+            timeout: '00:02:00'
+            continue_on_timeout: true
+          # Healthy after first reload? → done. Otherwise retry once.
+          - if:
+              - condition: state
+                entity_id: binary_sensor.mammotion_integration_healthy
+                state: 'off'
+            then:
+              - action: input_select.select_option
+                target:
+                  entity_id: input_select.mammotion_recovery_phase
+                data:
+                  option: reloading
+              # Touch 2 — reload retry.
+              - action: homeassistant.reload_config_entry
+                data:
+                  entry_id: !secret mammotion_config_entry_id
+              - wait_template: "{{ states('sensor.luba_3_activity_mode') not in ['unavailable','unknown','none',''] }}"
+                timeout: '00:03:00'
+                continue_on_timeout: true
+              - action: input_select.select_option
+                target:
+                  entity_id: input_select.mammotion_recovery_phase
+                data:
+                  option: reconnecting
+              - wait_template: "{{ is_state('binary_sensor.mammotion_integration_healthy','on') }}"
+                timeout: '00:02:00'
+                continue_on_timeout: true
+      # Result — idle (success) or failed (caller handles the failure).
+      - if:
+          - condition: state
+            entity_id: binary_sensor.mammotion_integration_healthy
+            state: 'on'
+        then:
+          - action: input_select.select_option
+            target:
+              entity_id: input_select.mammotion_recovery_phase
+            data:
+              option: idle
+          - action: input_number.set_value
+            target:
+              entity_id: input_number.mammotion_recovery_attempt
+            data:
+              value: 0
+        else:
+          - action: input_select.select_option
+            target:
+              entity_id: input_select.mammotion_recovery_phase
+            data:
+              option: failed

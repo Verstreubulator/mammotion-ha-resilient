@@ -1,0 +1,228 @@
+# =============================================================================
+# OPTIONAL LAYER — Plug-based charge tracking
+# =============================================================================
+# WHY THIS EXISTS (and why we think it's worth it)
+# -----------------------------------------------------------------------------
+# On our Luba 3, a firmware/telemetry quirk makes the battery% and docked state
+# FLAP — the battery reads 0 <-> 80 every few seconds, and can black out entirely
+# for a while. Because of that flapping, a battery-only "charged" signal
+# (`docked AND battery >= 80` held 5 min) NEVER reliably latched: every 0-flap
+# reset the 5-minute clock, so the mower would sit fully charged and the system
+# would never notice it was ready for the next zone.
+#
+# The fix that made the whole system dependable was to stop trusting the flapping
+# telemetry and read a signal that DOESN'T flap: the **power draw of the mower's
+# charging dock**, measured by a smart plug. Charging draws a lot; a charged mower
+# on standby draws a little; an empty dock draws almost nothing. Those bands are
+# rock-steady, so "charging finished" becomes a clean, physical edge.
+#
+# This is entirely OPTIONAL. The core package ships a simple battery-only
+# `binary_sensor.mower_charged` that works fine if your mower's telemetry is
+# stable. If yours flaps like ours — or you just want a more physical, restart-
+# proof "charge complete" signal — add a smart plug and install this file. It is
+# the single upgrade that moved our setup from "mostly works" to "runs unattended."
+#
+# WHAT YOU NEED
+# -----------------------------------------------------------------------------
+#   * A power-metering smart plug on the mower's charging dock that exposes an
+#     active-power sensor in Home Assistant (we used a Zigbee plug; any brand with
+#     a real-time wattage sensor works — Zooz/Zwave, TP-Link/Kasa, Shelly, etc.).
+#   * Point `sensor.mower_plug_power` below at YOUR plug's power sensor (or rename
+#     your sensor to that). See the `<<< EDIT` markers.
+#
+# MEASURE YOUR OWN POWER BANDS (important — ours will differ from yours)
+# -----------------------------------------------------------------------------
+# Watch your plug's wattage for a full cycle and note three bands:
+#   * OFF-DOCK  — mower away, dock idle. Ours: < 8 W.
+#   * STANDBY   — mower docked and charge COMPLETE. Ours: ~8-28 W.
+#   * CHARGING  — mower actively charging. Ours: >= 28 W (measured 30-220 W).
+# Then set the two thresholds below (`ON_DOCK_W` = 8, `CHARGING_W` = 28) to match.
+# The mower may stop at 80% or 100%; either way the plug drops to the standby band,
+# which is what we key "charged" off — no dependence on the battery reading at all.
+#
+# IF YOU INSTALL THIS FILE:
+#   * It REDEFINES `binary_sensor.mower_charged` on the plug signal (timestamp-based
+#     5-minute settle so it survives HA restarts). You MUST remove/comment out the
+#     battery-only `mower_charged` in `mammotion_core.yaml` so they don't collide
+#     (two entities can't share the `mower_charged` name/unique_id).
+#
+# Depends on: the Mammotion integration (the `luba_3` slug — rename to match your
+# mower) + a plug power sensor. The optional "maybe stuck" and "activity" blocks at
+# the bottom also read an orchestration/dispatch flag; those are clearly marked and
+# can be deleted if you don't run the orchestration tier.
+# Hot-reload templates/automations via the respective reloads; new input_* need a restart.
+# =============================================================================
+
+input_datetime:
+  # Stamped when the mower SETTLES into charged; `mower_charged` reads this for its
+  # restart-proof 5-min settle (a timestamp survives restarts; a `delay_on` doesn't).
+  mower_charge_completed:
+    name: Mower Charge Completed
+    has_date: true
+    has_time: true
+    # Old default so an un-stamped value reads as "long charged" -> mower_charged
+    # comes on immediately when genuinely settled (e.g. after a restart while
+    # already charged). A real charge stamps now() and starts the 5-min settle.
+    initial: "2020-01-01 00:00:00"
+
+  # OPTIONAL (only used by the "maybe stuck" backstop below): when the mower last
+  # LEFT the dock. Persisted (NO initial:) so an HA restart mid-mow can't reset it.
+  mower_left_dock_at:
+    name: Mower Left Dock At
+    has_date: true
+    has_time: true
+
+template:
+  # --- Stabilized battery: hold the last NON-ZERO reading (reject 0 dropouts) ----
+  # Optional but handy: a battery curve with the telemetry-flap zeros removed.
+  - trigger:
+      - trigger: state
+        entity_id: sensor.luba_3_battery        # <<< EDIT: your mower battery sensor
+    condition:
+      - condition: template
+        value_template: >-
+          {{ trigger.to_state.state not in ['unknown','unavailable','none']
+             and (trigger.to_state.state | float(-1)) > 0 }}
+    sensor:
+      - name: "Luba 3 Battery Stable"
+        unique_id: luba_3_battery_stable
+        device_class: battery
+        unit_of_measurement: "%"
+        state: "{{ trigger.to_state.state | int }}"
+
+  # --- Plug-band binary sensors (immune to the telemetry flap) -------------------
+  - binary_sensor:
+      - name: "Mower On Dock"
+        unique_id: mower_on_dock
+        icon: mdi:home-import-outline
+        # >= ON_DOCK_W (8) = something on the dock drawing (charging or standby).
+        state: "{{ states('sensor.mower_plug_power') | float(-1) >= 8 }}"   # <<< EDIT band
+        delay_off: "00:00:30"   # ride out brief plug-report gaps
+
+      - name: "Mower Charging (Plug)"
+        unique_id: mower_charging_plug
+        icon: mdi:flash
+        # >= CHARGING_W (28) = actively charging. Standby is below this.
+        state: "{{ states('sensor.mower_plug_power') | float(-1) >= 28 }}"  # <<< EDIT band
+
+      - name: "Mower Settled Charged Raw"
+        unique_id: mower_settled_charged_raw
+        icon: mdi:battery-check
+        # "Ready to mow" raw condition = DOCKED and EITHER:
+        #   - stabilized battery >= 80%  (fires whether the mower stops at 80 or 100), OR
+        #   - plug in the standby band (charge complete) — the fallback when the
+        #     battery telemetry is blacked out / stale.
+        # The `b_low` guard stops the brief dock ramp transient (battery still low
+        # right after a mow) from flashing "Charged" before charging ramps up.
+        state: >-
+          {% set p = states('sensor.mower_plug_power') | float(-1) %}
+          {% set b = states('sensor.luba_3_battery_stable') %}
+          {% set b_num = b not in ['unknown','unavailable','none'] %}
+          {% set on_dock = p >= 8 %}
+          {% set standby = p >= 8 and p < 28 %}
+          {% set b_full = b_num and (b | int(0) >= 80) %}
+          {% set b_low = b_num and (b | int(0) < 75) %}
+          {{ on_dock and (b_full or (standby and not b_low)) }}
+        delay_on: "00:01:00"    # ignore the brief dock ramp transient
+        delay_off: "00:00:30"   # ride out a momentary dip out of the band
+
+      # --- THE point of this file: a plug-based, restart-proof `mower_charged` ----
+      # REPLACES the battery-only version in mammotion_core.yaml. Remove that one.
+      # "Charged & ready for the next task" = settled-charged raw, held 5 min via a
+      # TIMESTAMP so it survives HA restarts (a `delay_on` would reset on restart).
+      - name: "Mower Charged"
+        unique_id: mower_charged
+        icon: mdi:battery-charging-high
+        state: >-
+          {{ is_state('binary_sensor.mower_settled_charged_raw','on')
+             and (as_timestamp(now()) - as_timestamp(states('input_datetime.mower_charge_completed'), 0)) >= 300 }}
+
+automation:
+  # Stamp when the mower SETTLES into charged (charging -> standby, or docks full).
+  # `mower_charged` reads this timestamp for its 5-min settle.
+  - id: mower_stamp_charge_completed
+    alias: "Mower — Stamp Charge Completed (plug)"
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.mower_settled_charged_raw
+        from: "off"
+        to: "on"
+    actions:
+      - action: input_datetime.set_datetime
+        target: { entity_id: input_datetime.mower_charge_completed }
+        data: { timestamp: "{{ now().timestamp() }}" }
+    mode: single
+
+# =============================================================================
+# OPTIONAL EXTRAS below — a restart-proof "maybe stuck" backstop and a plug-native
+# unified status sensor. Both read a dispatch flag `input_text.mow_active_yard`
+# ('front'/'back'/'' — "which yard did WE send it to mow"). If you don't set such a
+# flag from your mow flow, either create it and set/clear it around your mows, or
+# delete these two blocks. `sensor.mower_activity` overlaps with the core's
+# `sensor.mower_status` — keep whichever you prefer.
+# =============================================================================
+#
+# template:
+#   - binary_sensor:
+#       - name: "Mower Maybe Stuck"
+#         unique_id: mower_maybe_stuck
+#         icon: mdi:robot-mower-outline
+#         # Off-dock >= 2.5h AND we actually dispatched it AND not near-done. The
+#         # `mow_active_yard` corroboration matters: sparse plug reporting can flip
+#         # `mower_on_dock` off transiently, so plug-alone would false-alarm. A
+#         # docked-idle mower and an away mower can both read ~0 W — the dispatch
+#         # flag is what disambiguates.
+#         state: >-
+#           {% set off_dock = is_state('binary_sensor.mower_on_dock','off') %}
+#           {% set prog = states('sensor.luba_3_progress') | float(0) %}
+#           {% set since = as_timestamp(states('input_datetime.mower_left_dock_at'), 0) %}
+#           {% set ha_mow = states('input_text.mow_active_yard') in ['front','back'] %}
+#           {{ off_dock and ha_mow and prog < 99 and since >= 1577836800
+#              and (as_timestamp(now()) - since) >= 9000 }}
+#
+#   - sensor:
+#       - name: "Mower Activity"
+#         unique_id: mower_activity
+#         # A plug-native unified status built ONLY on flap-proof signals (plug +
+#         # job progress + your dispatch flag), never the flapping mower state.
+#         state: >-
+#           {% set on_dock = is_state('binary_sensor.mower_on_dock','on') %}
+#           {% set prog = states('sensor.luba_3_progress') | float(-1) %}
+#           {% set yard = states('input_text.mow_active_yard') %}
+#           {% if not on_dock %}
+#             {% if prog >= 99 %}Returning
+#             {% elif yard == 'front' %}Mowing Front
+#             {% elif yard == 'back' %}Mowing Back
+#             {% else %}Mowing{% endif %}
+#           {% else %}
+#             {% if is_state('binary_sensor.mower_charged','on') %}Ready
+#             {% elif is_state('binary_sensor.mower_charging_plug','on') %}Charging
+#             {% elif is_state('binary_sensor.mower_settled_charged_raw','on') %}Charged
+#             {% else %}Docked{% endif %}
+#           {% endif %}
+#
+# automation:
+#   - id: mower_stamp_left_dock
+#     alias: "Mower — Stamp Left-Dock Time"
+#     triggers:
+#       - trigger: state
+#         entity_id: binary_sensor.mower_on_dock
+#         from: "on"
+#         to: "off"
+#         id: leave
+#       - trigger: homeassistant
+#         event: start
+#         id: start
+#     actions:
+#       - if:
+#           - condition: template
+#             value_template: >-
+#               {{ trigger.id == 'leave'
+#                  or (trigger.id == 'start'
+#                      and is_state('binary_sensor.mower_on_dock','off')
+#                      and as_timestamp(states('input_datetime.mower_left_dock_at'), 0) < 1577836800) }}
+#         then:
+#           - action: input_datetime.set_datetime
+#             target: { entity_id: input_datetime.mower_left_dock_at }
+#             data: { timestamp: "{{ now().timestamp() }}" }
+#     mode: single

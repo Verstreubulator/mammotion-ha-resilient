@@ -1,0 +1,1036 @@
+# =============================================================================
+# REFERENCE ONLY — this is our EXACT config, NOT a drop-in.
+# =============================================================================
+# This file is copied verbatim from a real, working Home Assistant install so
+# you can see how a fully VPD-driven per-yard mow scheduler actually fits
+# together. It is TIED TO OUR SPECIFIC SENSORS and entity names (our VPD sensor,
+# our two lawns "front"/"back", our Luba 3 slug `luba_3`, our rain veto). It will
+# NOT work if you paste it in as-is.
+#
+# Read examples/vpd-scheduling-example.md FIRST — it explains the idea and walks
+# the important pieces. Treat this file as the annotated source behind that
+# example: inspiration to adapt, not a package to install.
+#
+# Sensors this assumes you would substitute with your own:
+#   * sensor.outdoor_vpd_combined      — your vapor-pressure-deficit sensor (kPa)
+#   * binary_sensor.mow_lawn_wet /     — the rain veto (see packages/mammotion_rain_gate.yaml
+#     binary_sensor.mow_rain_significant  for a generic, installable version -> binary_sensor.mow_rain_veto)
+#   * binary_sensor.gate               — OPTIONAL front-garden gate; delete if you have none
+#   * lawn_mower.luba_3 + sensor.luba_3_* / number.luba_3_working_speed
+#                                      — rename to your own mower's entity slug
+#   * weather.openweathermap           — your weather integration (hourly forecast)
+#
+# Built on top of the community integration mikey0000/Mammotion-HA and
+# pymammotion — thank you to the maintainers and contributors.
+# =============================================================================
+
+# =============================================================================
+# VPD-DRIVEN SMART MOW — fully per-yard, self-regulating rebuild
+# =============================================================================
+# ADDITIVE and revertible: delete this file + restart to remove entirely. The
+# proven old Smart launcher (automations.yaml `mow_smart_start_launch`) stays in
+# charge until `input_boolean.mow_vpd_driven_live` is turned ON (Phase D wires
+# the handoff). Everything here through Phase C is READ-ONLY / observational.
+#
+# Design + decisions: project_mower_vpd_driven (memory) and H:\docs\mower.md.
+# Frozen baseline of the old system: H:\docs\mower_smartmode_baseline_20260703.md.
+#
+# PHASE A (this block): calibrated per-yard VPD thresholds, `*_vpd_ready` sensors
+# (20-min sustained debounce), per-yard due tracker, and speed-normalized
+# duration + charge learners (x / y / z) via EMA (recent-weighted, self-tuning).
+# =============================================================================
+
+input_number:
+  # --- Per-yard VPD thresholds (kPa) — tune in dashboard Settings ------------
+  # Seeds: patio SHT45 May curve at each yard's known-good time (front 10 AM,
+  # back 11:30). The 20-min debounce adds a safety margin (ready fires ~20 min
+  # after the level is first reached). Lower a threshold = mow earlier.
+  mow_vpd_threshold_front:
+    name: "Mow VPD Threshold — Front"
+    min: 0.5
+    max: 3.0
+    step: 0.01
+    unit_of_measurement: kPa
+    mode: box
+    icon: mdi:water-percent
+  mow_vpd_threshold_back:
+    name: "Mow VPD Threshold — Back"
+    min: 0.5
+    max: 3.0
+    step: 0.01
+    unit_of_measurement: kPa
+    mode: box
+    icon: mdi:water-percent
+  # --- Cadence + backstop + buffer knobs ------------------------------------
+  mow_cadence_days:
+    name: "Mow Cadence (days)"
+    min: 1
+    max: 7
+    step: 0.5
+    unit_of_measurement: d
+    mode: box
+    icon: mdi:calendar-refresh
+  mow_backstop_after_days:
+    name: "Mow Overdue Backstop After (days)"
+    min: 2
+    max: 10
+    step: 0.5
+    unit_of_measurement: d
+    mode: box
+    icon: mdi:lifebuoy
+  mow_duration_buffer_pct:
+    name: "Mow Duration Safety Buffer (%)"
+    min: 0
+    max: 50
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+    icon: mdi:timer-alert
+  # --- Self-learning duration estimates (EMA, updated per completed mow) -----
+  # Stored as "minutes at 1 ft/s" (speed-independent). Predict = value / speed.
+  # Seed once to the current best estimate; each mow nudges 30% toward the new
+  # speed-normalized sample. Charge is speed-independent (raw minutes).
+  mow_front_min_at_1fps:
+    name: "Mow Front Min At 1fps (learned)"
+    min: 0
+    max: 600
+    step: 0.1
+    unit_of_measurement: min
+    icon: mdi:timer-cog
+  mow_back_min_at_1fps:
+    name: "Mow Back Min At 1fps (learned)"
+    min: 0
+    max: 600
+    step: 0.1
+    unit_of_measurement: min
+    icon: mdi:timer-cog
+  mow_charge_est_min:
+    name: "Mow Charge Estimate (learned)"
+    min: 0
+    max: 600
+    step: 0.1
+    unit_of_measurement: min
+    icon: mdi:battery-clock
+
+input_boolean:
+  # Master handoff — OFF = old launcher runs; ON = new per-yard dispatcher (Phase D).
+  mow_vpd_driven_live:
+    name: "VPD-Driven Smart Mow — Live"
+    icon: mdi:robot-mower
+  # Optional anti-overgrowth backstop (forces a due, dry, feasible yard at its
+  # latest-start when VPD never crossed AND it's overdue).
+  mow_backstop_enabled:
+    name: "Mow Overdue Backstop — Enabled"
+    icon: mdi:lifebuoy
+  # System-level Smart-Mow FREQUENCY switch (both lawns; how the system runs, not
+  # a per-lawn control). OFF = alternate-days (effective cadence = the
+  # input_number.mow_cadence_days knob, default 2). ON = every day (effective
+  # cadence = 1). Shifts ONLY the frequency TARGET the per-yard due-gates aim at;
+  # the finish-by half-yard split, rain vetoes, and overdue backstop all keep
+  # working unchanged and simply target the new daily rhythm — so if a full daily
+  # mow can't finish (weather/deadline) it auto-adapts to half-today/half-tomorrow
+  # and mows as often as it can until it can go daily again. See mower.md §10.39.
+  mow_smart_every_day:
+    name: "Smart Mow — Every Day"
+    icon: mdi:calendar-today
+  # Restart-resilient "a VPD-dispatched mow is in progress" flag — set at dispatch,
+  # cleared on completion. Keeps a dispatched mow HA-managed across a restart, and
+  # blocks the dispatcher from overlapping a mow it can no longer see via the script.
+  mow_vpd_mowing:
+    name: "VPD Mow In Progress"
+    icon: mdi:robot-mower
+
+# =============================================================================
+# PHASE B — "today's plan" display + passive per-yard cadence detection
+# =============================================================================
+input_text:
+  # Passively-tracked yard the mower is CURRENTLY cutting (front/back/'') so an
+  # app- or manual-started mow still updates the cadence clock on completion.
+  mow_active_yard:
+    name: "Mow Active Yard"
+    icon: mdi:map-marker
+    max: 12
+
+input_datetime:
+  # --- Per-yard EARLIEST mow floors (time-only) -----------------------------
+  # Hard "never mow this yard before" times. The front usually dries ~1 h before
+  # the back (part of the back is shaded), so the front floor is set earlier.
+  # These are floors, not targets — a yard still waits for VPD-ready on top. They
+  # ALSO cap the overdue-backstop: an overdue yard cannot mow before its floor.
+  # The whole-system emergency brake `mow_smart_earliest` still sits beneath both.
+  mow_earliest_front:
+    name: "Mow Earliest — Front"
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  mow_earliest_back:
+    name: "Mow Earliest — Back"
+    has_date: false
+    has_time: true
+    icon: mdi:clock-start
+  # Per-yard predicted VPD-threshold crossing times (Phase C forecaster).
+  # Sentinel 2099-01-01 = won't cross today; = now if already past threshold.
+  mow_front_vpd_cross_eta:
+    name: "Mow Front VPD Cross ETA"
+    has_date: true
+    has_time: true
+    icon: mdi:clock-start
+  mow_back_vpd_cross_eta:
+    name: "Mow Back VPD Cross ETA"
+    has_date: true
+    has_time: true
+    icon: mdi:clock-start
+
+  # Restart-proof VPD-ready gate (2026-07-26, mower.md §10.33): timestamp of when
+  # VPD last crossed ABOVE each yard's threshold. binary_sensor.mow_*_vpd_ready =
+  # (VPD>=thr AND now-since>=20min). Persisted (NO initial:) so an HA restart can't
+  # reset the 20-min sustain clock — the old delay_on DID reset on restart and
+  # caused the missed 2026-07-26 10am mow. Stamped by automation mow_stamp_vpd_above_since.
+  mow_front_vpd_above_since:
+    name: "Mow Front VPD Above Since"
+    has_date: true
+    has_time: true
+    icon: mdi:clock-start
+  mow_back_vpd_above_since:
+    name: "Mow Back VPD Above Since"
+    has_date: true
+    has_time: true
+    icon: mdi:clock-start
+
+template:
+  - binary_sensor:
+      # --- Per-yard VPD readiness (20-min sustained) ------------------------
+      # float(-1) fail-safe: if VPD is unavailable, ready reads OFF (never a
+      # stale ON). delay_on gives the 20-min sustained-dry debounce.
+      # Restart-proof (2026-07-26): 20-min sustain via a PERSISTED timestamp
+      # (input_datetime.mow_*_vpd_above_since), NOT delay_on — so an HA restart
+      # can't reset the clock (the old delay_on did → missed the 10am mow). The
+      # `since >= 1577836800` (2020-01-01) floor rejects an unset/epoch default so
+      # an un-stamped helper never reads ready. mower.md §10.33.
+      - name: "Mow Front VPD Ready"
+        unique_id: mow_front_vpd_ready
+        icon: mdi:grass
+        state: >
+          {% set vpd = states('sensor.outdoor_vpd_combined') | float(-1) %}
+          {% set thr = states('input_number.mow_vpd_threshold_front') | float(1.34) %}
+          {% set since = as_timestamp(states('input_datetime.mow_front_vpd_above_since'), 0) %}
+          {{ vpd >= thr and since >= 1577836800 and (as_timestamp(now()) - since) >= 1200 }}
+      - name: "Mow Back VPD Ready"
+        unique_id: mow_back_vpd_ready
+        icon: mdi:grass
+        state: >
+          {% set vpd = states('sensor.outdoor_vpd_combined') | float(-1) %}
+          {% set thr = states('input_number.mow_vpd_threshold_back') | float(1.59) %}
+          {% set since = as_timestamp(states('input_datetime.mow_back_vpd_above_since'), 0) %}
+          {{ vpd >= thr and since >= 1577836800 and (as_timestamp(now()) - since) >= 1200 }}
+      # --- Per-yard "due" (days since last mow >= cadence) ------------------
+      - name: "Mow Front Due"
+        unique_id: mow_front_due
+        icon: mdi:calendar-check
+        state: >
+          {% set cad = 1 if is_state('input_boolean.mow_smart_every_day','on')
+                        else states('input_number.mow_cadence_days') | float(2) %}
+          {{ states('sensor.mow_front_days_since') | float(999) >= cad }}
+      - name: "Mow Back Due"
+        unique_id: mow_back_due
+        icon: mdi:calendar-check
+        state: >
+          {% set cad = 1 if is_state('input_boolean.mow_smart_every_day','on')
+                        else states('input_number.mow_cadence_days') | float(2) %}
+          {{ states('sensor.mow_back_days_since') | float(999) >= cad }}
+
+      # --- Debounced "auto-mow is genuinely held" — spam-proof source for the
+      #     Smart-Held notification (mower.md §10.31, 2026-07-26). The old notify
+      #     keyed on the FLAPPING sensor.mower_status / derived 'Recovery Failed'
+      #     (offline<->reconnecting every ~50s during the firmware break), so it
+      #     created/dismissed the notification in a loop = one phone push per flap
+      #     (worse when the user deleted it). This encodes the whole hold on
+      #     STABLE inputs — recovery PHASE, not the derived status — with a 10-min
+      #     delay_on debounce, so a genuine sustained block turns ON once and the
+      #     notify automation fires on the edge only.
+      - name: "Mow Smart Hold"
+        unique_id: mow_smart_hold
+        icon: mdi:pause-octagon
+        state: >
+          {% set live = is_state('input_boolean.mow_vpd_driven_live','on')
+                        and is_state('input_select.mower_mode','Smart Start') %}
+          {% set due = (is_state('binary_sensor.mow_front_due','on')
+                          and now() >= today_at(states('input_datetime.mow_earliest_front')))
+                       or (is_state('binary_sensor.mow_back_due','on')
+                          and now() >= today_at(states('input_datetime.mow_earliest_back'))) %}
+          {% set not_mowing = is_state('binary_sensor.lawn_mower_active','off') %}
+          {% set rec_failed = is_state('input_select.mammotion_recovery_phase','failed') %}
+          {% set rain_unknown = is_state('input_boolean.mow_rain_veto_enabled','on')
+                                and states('binary_sensor.mow_lawn_wet') in ['unknown','unavailable'] %}
+          {{ live and due and not_mowing and (rec_failed or rain_unknown) }}
+        delay_on: "00:10:00"
+        delay_off: "00:02:00"
+
+  - trigger:
+      - trigger: homeassistant
+        event: start
+      - trigger: time_pattern
+        minutes: "/5"
+      - trigger: state
+        entity_id:
+          - input_datetime.mow_front_yard_stop_time
+          - input_datetime.mow_backyard_stop_time
+          - number.luba_3_working_speed
+          - input_number.mow_front_min_at_1fps
+          - input_number.mow_back_min_at_1fps
+          - input_number.mow_charge_est_min
+    sensor:
+      # --- Days since each yard was last mowed (any source; stamped on the
+      #     per-yard stop_time, incl. passive detection added in Phase B) -----
+      - name: "Mow Front Days Since"
+        unique_id: mow_front_days_since
+        unit_of_measurement: d
+        icon: mdi:calendar-clock
+        state: >
+          {% set t = as_timestamp(states('input_datetime.mow_front_yard_stop_time'), 0) %}
+          {{ ((now().timestamp() - t) / 86400) | round(2) if t > 0 else 999 }}
+      - name: "Mow Back Days Since"
+        unique_id: mow_back_days_since
+        unit_of_measurement: d
+        icon: mdi:calendar-clock
+        state: >
+          {% set t = as_timestamp(states('input_datetime.mow_backyard_stop_time'), 0) %}
+          {{ ((now().timestamp() - t) / 86400) | round(2) if t > 0 else 999 }}
+      # --- Speed-scaled expected durations (minutes) ------------------------
+      # Predict = learned minutes-at-1-ft/s ÷ current working speed. See §10.23.
+      - name: "Mow Front Expected Min"
+        unique_id: mow_front_expected_min
+        unit_of_measurement: min
+        icon: mdi:timer-outline
+        state: >
+          {% set ws = [states('number.luba_3_working_speed') | float(1.0), 0.3] | max %}
+          {% set norm = states('input_number.mow_front_min_at_1fps') | float(91) %}
+          {% if norm < 5 %}{% set norm = 91 %}{% endif %}
+          {{ (norm / ws) | round(0) | int }}
+      - name: "Mow Back Expected Min"
+        unique_id: mow_back_expected_min
+        unit_of_measurement: min
+        icon: mdi:timer-outline
+        state: >
+          {% set ws = [states('number.luba_3_working_speed') | float(1.0), 0.3] | max %}
+          {% set norm = states('input_number.mow_back_min_at_1fps') | float(98) %}
+          {% if norm < 5 %}{% set norm = 98 %}{% endif %}
+          {{ (norm / ws) | round(0) | int }}
+      - name: "Mow Both Expected Min"
+        unique_id: mow_both_expected_min
+        unit_of_measurement: min
+        icon: mdi:timer-outline
+        state: >
+          {% set f = states('sensor.mow_front_expected_min') | float(0) %}
+          {% set b = states('sensor.mow_back_expected_min') | float(0) %}
+          {% set c = states('input_number.mow_charge_est_min') | float(60) %}
+          {% if c < 5 %}{% set c = 60 %}{% endif %}
+          {{ (f + b + c) | round(0) | int }}
+
+  # --- "Today's plan" — a PREVIEW of what the Phase-D dispatcher would do -----
+  - trigger:
+      - trigger: homeassistant
+        event: start
+      - trigger: time_pattern
+        minutes: "/2"
+      - trigger: state
+        entity_id:
+          - binary_sensor.mow_front_vpd_ready
+          - binary_sensor.mow_back_vpd_ready
+          - binary_sensor.mow_front_due
+          - binary_sensor.mow_back_due
+          - binary_sensor.gate
+          - binary_sensor.mow_lawn_wet
+    sensor:
+      - name: "Mow Today Plan"
+        unique_id: mow_today_plan
+        icon: mdi:clipboard-text-clock
+        state: >
+          {% set fb = today_at(states('input_datetime.mow_smart_finish_by')) %}
+          {% set m = states('input_number.mow_smart_finish_margin_min') | float(5) %}
+          {% set buf = 1 + (states('input_number.mow_duration_buffer_pct') | float(15)) / 100 %}
+          {% set fexp = states('sensor.mow_front_expected_min') | float(91) * buf %}
+          {% set bexp = states('sensor.mow_back_expected_min') | float(98) * buf %}
+          {% set wet = is_state('binary_sensor.mow_lawn_wet','on') and is_state('input_boolean.mow_rain_veto_enabled','on') %}
+          {% set f_due = is_state('binary_sensor.mow_front_due','on') %}
+          {% set b_due = is_state('binary_sensor.mow_back_due','on') %}
+          {% set gate = is_state('binary_sensor.gate','on') %}
+          {% set f_feas = now() <= fb - timedelta(minutes = m + fexp) %}
+          {% set b_feas = now() <= fb - timedelta(minutes = m + bexp) %}
+          {% set f_early = now() >= today_at(states('input_datetime.mow_earliest_front')) %}
+          {% set b_early = now() >= today_at(states('input_datetime.mow_earliest_back')) %}
+          {% set f_go = f_due and gate and f_feas and f_early and not wet %}
+          {% set b_go = b_due and b_feas and b_early and not wet %}
+          {% if wet %}Rain hold
+          {% elif f_go and b_go %}Both
+          {% elif f_go %}Front only
+          {% elif b_go %}Back only
+          {% elif not f_due and not b_due %}None due
+          {% else %}Blocked{% endif %}
+        attributes:
+          headline: >
+            {% set vpd = states('sensor.outdoor_vpd_combined') | float(0) %}
+            {% set fb = today_at(states('input_datetime.mow_smart_finish_by')) %}
+            {% set m = states('input_number.mow_smart_finish_margin_min') | float(5) %}
+            {% set buf = 1 + (states('input_number.mow_duration_buffer_pct') | float(15)) / 100 %}
+            {% set fexp = states('sensor.mow_front_expected_min') | float(91) * buf %}
+            {% set bexp = states('sensor.mow_back_expected_min') | float(98) * buf %}
+            {% set wet = is_state('binary_sensor.mow_lawn_wet','on') and is_state('input_boolean.mow_rain_veto_enabled','on') %}
+            {% set f_due = is_state('binary_sensor.mow_front_due','on') %}
+            {% set b_due = is_state('binary_sensor.mow_back_due','on') %}
+            {% set gate = is_state('binary_sensor.gate','on') %}
+            {% set f_ready = is_state('binary_sensor.mow_front_vpd_ready','on') %}
+            {% set b_ready = is_state('binary_sensor.mow_back_vpd_ready','on') %}
+            {% set f_feas = now() <= fb - timedelta(minutes = m + fexp) %}
+            {% set b_feas = now() <= fb - timedelta(minutes = m + bexp) %}
+            {% set f_early = now() >= today_at(states('input_datetime.mow_earliest_front')) %}
+            {% set b_early = now() >= today_at(states('input_datetime.mow_earliest_back')) %}
+            {% set f_floor = today_at(states('input_datetime.mow_earliest_front')).strftime('%-I:%M %p') %}
+            {% set b_floor = today_at(states('input_datetime.mow_earliest_back')).strftime('%-I:%M %p') %}
+            {% set fmsg = 'Front: not due yet' if not f_due else ('Front: due — waiting for the gate to open' if not gate else ('Front: due — too late to finish by ' ~ fb.strftime('%-I:%M %p') if not f_feas else ('Front: holding until ' ~ f_floor ~ ' (earliest)' if not f_early else ('Front: ready to mow now' if f_ready else 'Front: waiting for VPD (' ~ (vpd | round(2)) ~ '/' ~ states('input_number.mow_vpd_threshold_front') ~ ')')))) %}
+            {% set bmsg = 'Back: not due yet' if not b_due else ('Back: due — too late to finish by ' ~ fb.strftime('%-I:%M %p') if not b_feas else ('Back: holding until ' ~ b_floor ~ ' (earliest)' if not b_early else ('Back: ready to mow now' if b_ready else 'Back: waiting for VPD (' ~ (vpd | round(2)) ~ '/' ~ states('input_number.mow_vpd_threshold_back') ~ ')'))) %}
+            {% if wet %}🌧️ Rain hold — lawn too wet to mow{% else %}{{ fmsg }} · {{ bmsg }}{% endif %}
+          detail: >
+            {% set ed = is_state('input_boolean.mow_smart_every_day','on') %}
+            Cadence {{ 1 if ed else states('input_number.mow_cadence_days') }} d{{ ' — Every Day' if ed else '' }} · front {{ states('sensor.mow_front_days_since') }} d / back {{ states('sensor.mow_back_days_since') }} d since mowed · est front {{ states('sensor.mow_front_expected_min') }}m / back {{ states('sensor.mow_back_expected_min') }}m · PREVIEW only (dispatcher live: {{ 'ON' if is_state('input_boolean.mow_vpd_driven_live','on') else 'OFF' }})
+
+  # ===========================================================================
+  # Recent-mows DISPLAY sensors (#10, 2026-07-20) — validated, order-agnostic.
+  # The per-yard stop_time doubles as the dispatcher's "handled" launch marker,
+  # stamped ~17 s BEFORE the in-script start stamp. So stop > start ⇔ a genuine
+  # completion; stop <= start ⇔ in-flight or a killed/incomplete mow (which used
+  # to leave a bogus "stop 17 s before start" + a stale duration on the card).
+  # Each reads its OWN yard's helpers, so the front can never show the back's
+  # numbers (the old whole-yard-orchestration overwrite). Session total =
+  # min(start) → max(stop) across BOTH yards (incl. the between-lawn charge),
+  # order-agnostic, grouped only when the two valid mows are within 6 h.
+  # "In progress" keys on input_text.mow_active_yard (set by the per-yard
+  # dispatcher). DISPLAY ONLY — touches NO control/cadence logic.
+  # ===========================================================================
+  - trigger:
+      - trigger: homeassistant
+        event: start
+      - trigger: time_pattern
+        minutes: "/1"
+      - trigger: state
+        entity_id:
+          - input_datetime.mow_front_yard_start_time
+          - input_datetime.mow_front_yard_stop_time
+          - input_datetime.mow_backyard_start_time
+          - input_datetime.mow_backyard_stop_time
+          - input_text.mow_active_yard
+    sensor:
+      - name: "Mow Front Started Display"
+        unique_id: mow_front_started_display
+        icon: mdi:flag
+        state: >
+          {% set st = as_timestamp(states('input_datetime.mow_front_yard_start_time'), 0) %}
+          {% if st > 0 %}{{ st | timestamp_custom('%-I:%M %p', true) }}{% else %}—{% endif %}
+      - name: "Mow Front Stopped Display"
+        unique_id: mow_front_stopped_display
+        icon: mdi:flag-checkered
+        state: >
+          {% set st = as_timestamp(states('input_datetime.mow_front_yard_start_time'), 0) %}
+          {% set sp = as_timestamp(states('input_datetime.mow_front_yard_stop_time'), 0) %}
+          {% if sp > st %}{{ sp | timestamp_custom('%-I:%M %p', true) }}
+          {% elif is_state('input_text.mow_active_yard','front') %}In progress
+          {% else %}—{% endif %}
+      - name: "Mow Front Duration Display"
+        unique_id: mow_front_duration_display
+        icon: mdi:timer-outline
+        state: >
+          {% set st = as_timestamp(states('input_datetime.mow_front_yard_start_time'), 0) %}
+          {% set sp = as_timestamp(states('input_datetime.mow_front_yard_stop_time'), 0) %}
+          {% if sp > st %}
+            {% set s = (sp - st) | int %}{% set h = s // 3600 %}{% set m = (s % 3600) // 60 %}
+            {% if h > 0 %}{{ h }}h {{ m }}m{% else %}{{ m }}m{% endif %}
+          {% elif is_state('input_text.mow_active_yard','front') %}In progress
+          {% else %}—{% endif %}
+      - name: "Mow Back Started Display"
+        unique_id: mow_back_started_display
+        icon: mdi:flag
+        state: >
+          {% set st = as_timestamp(states('input_datetime.mow_backyard_start_time'), 0) %}
+          {% if st > 0 %}{{ st | timestamp_custom('%-I:%M %p', true) }}{% else %}—{% endif %}
+      - name: "Mow Back Stopped Display"
+        unique_id: mow_back_stopped_display
+        icon: mdi:flag-checkered
+        state: >
+          {% set st = as_timestamp(states('input_datetime.mow_backyard_start_time'), 0) %}
+          {% set sp = as_timestamp(states('input_datetime.mow_backyard_stop_time'), 0) %}
+          {% if sp > st %}{{ sp | timestamp_custom('%-I:%M %p', true) }}
+          {% elif is_state('input_text.mow_active_yard','back') %}In progress
+          {% else %}—{% endif %}
+      - name: "Mow Back Duration Display"
+        unique_id: mow_back_duration_display
+        icon: mdi:timer-outline
+        state: >
+          {% set st = as_timestamp(states('input_datetime.mow_backyard_start_time'), 0) %}
+          {% set sp = as_timestamp(states('input_datetime.mow_backyard_stop_time'), 0) %}
+          {% if sp > st %}
+            {% set s = (sp - st) | int %}{% set h = s // 3600 %}{% set m = (s % 3600) // 60 %}
+            {% if h > 0 %}{{ h }}h {{ m }}m{% else %}{{ m }}m{% endif %}
+          {% elif is_state('input_text.mow_active_yard','back') %}In progress
+          {% else %}—{% endif %}
+      - name: "Mow Session Total"
+        unique_id: mow_session_total
+        icon: mdi:clock-outline
+        # min(start) → max(stop) across BOTH yards incl. the between-lawn charge.
+        # Grouped only when the two valid mows are within 6 h (21600 s); else the
+        # most recent single yard. "In progress" while either yard is mowing.
+        state: >
+          {% set fs = as_timestamp(states('input_datetime.mow_front_yard_start_time'), 0) %}
+          {% set fe = as_timestamp(states('input_datetime.mow_front_yard_stop_time'), 0) %}
+          {% set bs = as_timestamp(states('input_datetime.mow_backyard_start_time'), 0) %}
+          {% set be = as_timestamp(states('input_datetime.mow_backyard_stop_time'), 0) %}
+          {% set f_ok = fs > 0 and fe > fs %}
+          {% set b_ok = bs > 0 and be > bs %}
+          {% set ns = namespace(a=0, z=0) %}
+          {% if f_ok and b_ok %}
+            {% if ([fs, bs] | max) - ([fe, be] | min) <= 21600 %}
+              {% set ns.a = [fs, bs] | min %}{% set ns.z = [fe, be] | max %}
+            {% elif fe >= be %}{% set ns.a = fs %}{% set ns.z = fe %}
+            {% else %}{% set ns.a = bs %}{% set ns.z = be %}{% endif %}
+          {% elif f_ok %}{% set ns.a = fs %}{% set ns.z = fe %}
+          {% elif b_ok %}{% set ns.a = bs %}{% set ns.z = be %}{% endif %}
+          {% if is_state('input_text.mow_active_yard','front') or is_state('input_text.mow_active_yard','back') %}In progress
+          {% elif ns.z > ns.a %}
+            {% set s = (ns.z - ns.a) | int %}{% set h = s // 3600 %}{% set m = (s % 3600) // 60 %}
+            {% if h > 0 %}{{ h }}h {{ m }}m{% else %}{{ m }}m{% endif %}
+          {% else %}—{% endif %}
+        attributes:
+          window: >
+            {% set fs = as_timestamp(states('input_datetime.mow_front_yard_start_time'), 0) %}
+            {% set fe = as_timestamp(states('input_datetime.mow_front_yard_stop_time'), 0) %}
+            {% set bs = as_timestamp(states('input_datetime.mow_backyard_start_time'), 0) %}
+            {% set be = as_timestamp(states('input_datetime.mow_backyard_stop_time'), 0) %}
+            {% set f_ok = fs > 0 and fe > fs %}
+            {% set b_ok = bs > 0 and be > bs %}
+            {% set ns = namespace(a=0, z=0) %}
+            {% if f_ok and b_ok %}
+              {% if ([fs, bs] | max) - ([fe, be] | min) <= 21600 %}
+                {% set ns.a = [fs, bs] | min %}{% set ns.z = [fe, be] | max %}
+              {% elif fe >= be %}{% set ns.a = fs %}{% set ns.z = fe %}
+              {% else %}{% set ns.a = bs %}{% set ns.z = be %}{% endif %}
+            {% elif f_ok %}{% set ns.a = fs %}{% set ns.z = fe %}
+            {% elif b_ok %}{% set ns.a = bs %}{% set ns.z = be %}{% endif %}
+            {% if ns.z > ns.a %}{{ ns.a | timestamp_custom('%-I:%M %p', true) }} → {{ ns.z | timestamp_custom('%-I:%M %p', true) }}{% else %}—{% endif %}
+
+automation:
+  # --- Restart-proof VPD-ready: stamp when VPD crosses ABOVE each threshold ----
+  # Replaces the delay_on on binary_sensor.mow_*_vpd_ready (delay_on reset on every
+  # HA restart → missed the 2026-07-26 10am mow). Stamps input_datetime.
+  # mow_*_vpd_above_since on a genuine below->above VPD crossing; on HA start, seeds
+  # it ONLY if VPD is already above AND the stamp is unset (< 2020) — and NEVER
+  # re-stamps a valid stamp, so the 20-min sustain clock survives restarts. §10.33.
+  - id: mow_stamp_vpd_above_since
+    alias: "Mow — Stamp VPD Above-Threshold Time (restart-proof)"
+    triggers:
+      - trigger: state
+        entity_id: sensor.outdoor_vpd_combined
+        id: vpd
+      - trigger: homeassistant
+        event: start
+        id: start
+    actions:
+      - variables:
+          n: "{{ states('sensor.outdoor_vpd_combined') | float(-1) }}"
+          o: "{{ trigger.from_state.state | float(-1) if trigger.id == 'vpd' else -1 }}"
+          now_ts: "{{ now().timestamp() }}"
+          tf: "{{ states('input_number.mow_vpd_threshold_front') | float(1.34) }}"
+          tb: "{{ states('input_number.mow_vpd_threshold_back') | float(1.59) }}"
+          sf: "{{ as_timestamp(states('input_datetime.mow_front_vpd_above_since'), 0) }}"
+          sb: "{{ as_timestamp(states('input_datetime.mow_back_vpd_above_since'), 0) }}"
+      - if: "{{ n >= tf and ( (trigger.id == 'vpd' and o < tf) or (trigger.id == 'start' and sf < 1577836800) ) }}"
+        then:
+          - action: input_datetime.set_datetime
+            target: { entity_id: input_datetime.mow_front_vpd_above_since }
+            data: { timestamp: "{{ now_ts }}" }
+      - if: "{{ n >= tb and ( (trigger.id == 'vpd' and o < tb) or (trigger.id == 'start' and sb < 1577836800) ) }}"
+        then:
+          - action: input_datetime.set_datetime
+            target: { entity_id: input_datetime.mow_back_vpd_above_since }
+            data: { timestamp: "{{ now_ts }}" }
+    mode: queued
+    max: 10
+
+  # --- EMA-learn a speed-normalized FRONT duration on each completed mow -----
+  - id: mow_capture_front_norm
+    alias: "Mow — Learn Front Duration"
+    description: >-
+      When a front mow completes, sensor.mow_front_yard_duration_minutes settles
+      to its final value. Sample = duration × working_speed = minutes-at-1-ft/s
+      (speed-independent). EMA: new = 0.7·old + 0.3·sample. Guard > 5 min.
+    triggers:
+      - trigger: state
+        entity_id: sensor.mow_front_yard_duration_minutes
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ trigger.from_state is not none
+             and trigger.from_state.state not in ['unknown','unavailable','none','']
+             and trigger.to_state.state not in ['unknown','unavailable','none','']
+             and (trigger.to_state.state | float(0)) > 5 }}
+    actions:
+      - action: input_number.set_value
+        target:
+          entity_id: input_number.mow_front_min_at_1fps
+        data:
+          value: >-
+            {% set cur = states('input_number.mow_front_min_at_1fps') | float(91) %}
+            {% if cur < 5 %}{% set cur = 91 %}{% endif %}
+            {% set ws = [states('number.luba_3_working_speed') | float(1.0), 0.3] | max %}
+            {% set sample = (trigger.to_state.state | float(0)) * ws %}
+            {{ (0.7 * cur + 0.3 * sample) | round(1) }}
+    mode: single
+
+  # --- EMA-learn a speed-normalized BACK duration ---------------------------
+  - id: mow_capture_back_norm
+    alias: "Mow — Learn Back Duration"
+    triggers:
+      - trigger: state
+        entity_id: sensor.mow_backyard_duration_minutes
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ trigger.from_state is not none
+             and trigger.from_state.state not in ['unknown','unavailable','none','']
+             and trigger.to_state.state not in ['unknown','unavailable','none','']
+             and (trigger.to_state.state | float(0)) > 5 }}
+    actions:
+      - action: input_number.set_value
+        target:
+          entity_id: input_number.mow_back_min_at_1fps
+        data:
+          value: >-
+            {% set cur = states('input_number.mow_back_min_at_1fps') | float(98) %}
+            {% if cur < 5 %}{% set cur = 98 %}{% endif %}
+            {% set ws = [states('number.luba_3_working_speed') | float(1.0), 0.3] | max %}
+            {% set sample = (trigger.to_state.state | float(0)) * ws %}
+            {{ (0.7 * cur + 0.3 * sample) | round(1) }}
+    mode: single
+
+  # --- EMA-learn a between-lawn CHARGE duration -----------------------------
+  - id: mow_capture_charge
+    alias: "Mow — Learn Charge Duration"
+    description: >-
+      When the mower reaches charged (80%) DURING an orchestration charge wait,
+      EMA-learn how long the charge took (charged_time − charge_start). Overnight
+      full charges are excluded by the phase gate. Speed-independent.
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.mower_charged
+        from: "off"
+        to: "on"
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ states('input_select.mow_yard_phase') in ['charge_wait_for_back','charge_wait_for_front_2'] }}
+      - condition: template
+        value_template: >-
+          {% set s = as_timestamp(states('input_datetime.luba_charge_start_time'), 0) %}
+          {% set m = (now().timestamp() - s) / 60 %}
+          {{ s > 0 and m > 1 and m < 300 }}
+    actions:
+      - action: input_number.set_value
+        target:
+          entity_id: input_number.mow_charge_est_min
+        data:
+          value: >-
+            {% set cur = states('input_number.mow_charge_est_min') | float(60) %}
+            {% if cur < 5 %}{% set cur = 60 %}{% endif %}
+            {% set sample = (now().timestamp() - as_timestamp(states('input_datetime.luba_charge_start_time'), 0)) / 60 %}
+            {{ (0.7 * cur + 0.3 * sample) | round(1) }}
+    mode: single
+
+  # --- PHASE B: track which yard is being cut (for cadence stamping) ---------
+  - id: mow_track_active_yard
+    alias: "Mow — Track Active Yard (cadence)"
+    description: >-
+      While mowing, record the yard from mower_status.current_zone so an app- or
+      manual-started mow can stamp the cadence clock on completion.
+    triggers:
+      - trigger: state
+        entity_id: sensor.mower_status
+      - trigger: time_pattern
+        minutes: "/2"
+    conditions:
+      - condition: state
+        entity_id: sensor.mower_status
+        state: mowing
+    actions:
+      - choose:
+          - conditions: "{{ state_attr('sensor.mower_status','current_zone') == 'front lawn' }}"
+            sequence:
+              - action: input_text.set_value
+                target: { entity_id: input_text.mow_active_yard }
+                data: { value: front }
+          - conditions: "{{ state_attr('sensor.mower_status','current_zone') == 'back lawn' }}"
+            sequence:
+              - action: input_text.set_value
+                target: { entity_id: input_text.mow_active_yard }
+                data: { value: back }
+    mode: single
+
+  # --- PHASE B: stamp the cadence clock when an app/manual mow completes -----
+  - id: mow_passive_stamp
+    alias: "Mow — Stamp Yard Complete (robust)"
+    description: >-
+      Reliably records a per-yard mow completion — for the cadence clock AND to
+      clear the re-dispatch guard — the instant the mower docks / starts charging
+      / hits 100%. Tolerant of the `reconnecting` blip on the way to the dock (the
+      old `mowing → charging` edge could be missed, which caused the 2026-07-04
+      front-re-mow bug). Fires for ANY mow (VPD dispatcher, whole-yard, app/manual)
+      while a yard is tracked. Stamps that yard's stop_time, clears the tracker,
+      and clears the VPD-mowing flag. Idempotent — clearing the tracker stops the
+      other completion triggers from double-stamping.
+    triggers:
+      - trigger: state
+        entity_id: lawn_mower.luba_3
+        to: docked
+      - trigger: state
+        entity_id: binary_sensor.luba_3_charging
+        from: "off"
+        to: "on"
+      - trigger: state
+        entity_id: sensor.luba_3_progress
+        to: "100"
+    conditions:
+      - condition: template
+        value_template: "{{ states('input_text.mow_active_yard') in ['front','back'] }}"
+    actions:
+      - choose:
+          - conditions: "{{ is_state('input_text.mow_active_yard','front') }}"
+            sequence:
+              - action: input_datetime.set_datetime
+                target: { entity_id: input_datetime.mow_front_yard_stop_time }
+                data: { datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}" }
+          - conditions: "{{ is_state('input_text.mow_active_yard','back') }}"
+            sequence:
+              - action: input_datetime.set_datetime
+                target: { entity_id: input_datetime.mow_backyard_stop_time }
+                data: { datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}" }
+      - action: input_text.set_value
+        target: { entity_id: input_text.mow_active_yard }
+        data: { value: "" }
+      - action: input_boolean.turn_off
+        target: { entity_id: input_boolean.mow_vpd_mowing }
+    mode: single
+
+  # --- PHASE C: per-yard VPD-crossing ETA forecast (front 1.34 / back 1.59) --
+  - id: mow_vpd_crossing_forecast_peryard
+    alias: "Mow — VPD Crossing Forecast (per-yard)"
+    description: >-
+      Per-yard twin of mower_vpd_crossing_forecast: predicts when TODAY's VPD
+      crosses each yard's threshold, bias-anchored to live VPD, from the cached
+      OWM hourly forecast (no API call). Writes mow_{front,back}_vpd_cross_eta
+      (2099 sentinel = won't cross today; = now if already past threshold).
+    triggers:
+      - trigger: time_pattern
+        minutes: "/15"
+      - trigger: homeassistant
+        event: start
+    conditions:
+      - condition: state
+        entity_id: input_select.mower_mode
+        state: Smart Start
+    actions:
+      - action: weather.get_forecasts
+        continue_on_error: true
+        data:
+          type: hourly
+        target:
+          entity_id: weather.openweathermap
+        response_variable: fc
+      - repeat:
+          for_each:
+            - { eta: input_datetime.mow_front_vpd_cross_eta, thr: input_number.mow_vpd_threshold_front }
+            - { eta: input_datetime.mow_back_vpd_cross_eta, thr: input_number.mow_vpd_threshold_back }
+          sequence:
+            - action: input_datetime.set_datetime
+              target:
+                entity_id: "{{ repeat.item.eta }}"
+              data:
+                datetime: >-
+                  {% set thr = states(repeat.item.thr) | float(1.34) %}
+                  {% set live = states('sensor.outdoor_vpd_combined') | float(0) %}
+                  {% set nowts = now().timestamp() %}
+                  {% set today = now().strftime('%Y-%m-%d') %}
+                  {% set ns = namespace(bias=none, eta=0) %}
+                  {% if fc is defined and fc and 'weather.openweathermap' in fc %}
+                    {% for h in fc['weather.openweathermap'].forecast %}
+                      {% set tF = h.temperature | float(none) %}
+                      {% set rh = h.humidity | float(none) %}
+                      {% set ht = as_timestamp(h.datetime, 0) %}
+                      {% if tF is not none and rh is not none and ht > 0 %}
+                        {% set tC = (tF - 32) * 5 / 9 %}
+                        {% set svp = 0.6108 * 2.718281828459045 ** (17.27 * tC / (tC + 237.3)) %}
+                        {% set fvpd = svp * (1 - rh / 100) %}
+                        {% if ns.bias is none and ht >= nowts - 3600 %}
+                          {% set ns.bias = live - fvpd %}
+                        {% endif %}
+                        {% if ns.bias is not none and ns.eta == 0 and ht >= nowts
+                              and (ht | timestamp_custom('%Y-%m-%d', true)) == today
+                              and (fvpd + ns.bias) >= thr %}
+                          {% set ns.eta = ht %}
+                        {% endif %}
+                      {% endif %}
+                    {% endfor %}
+                  {% endif %}
+                  {% set final = nowts if live >= thr else ns.eta %}
+                  {% if final > 0 %}{{ final | timestamp_custom('%Y-%m-%d %H:%M:%S', true) }}{% else %}2099-01-01 00:00:00{% endif %}
+    mode: single
+
+  # ===========================================================================
+  # PHASE D — the per-yard DISPATCHER (acts only when Live toggle is ON)
+  # ===========================================================================
+  # Every minute (and on ready edges), if the mower is free/healthy and it's dry,
+  # dispatch ONE yard's AUTONOMOUS script when that yard is due + VPD-ready (or
+  # overdue-backstop) + feasible before the finish-by. "Both in a day" and
+  # "alternate when short" EMERGE from repeated single-yard dispatch. Front goes
+  # first (gate + earlier VPD); the back follows after front finishes & recharges.
+  # Gated behind input_boolean.mow_vpd_driven_live — the OLD launcher stays in
+  # charge until you flip it (mow_smart_start_launch carries the inverse gate).
+  # ===========================================================================
+  - id: mow_vpd_dispatch
+    alias: "Mow — VPD-Driven Dispatcher"
+    triggers:
+      - trigger: time_pattern
+        minutes: "/1"
+      - trigger: state
+        entity_id:
+          - binary_sensor.mow_front_vpd_ready
+          - binary_sensor.mow_back_vpd_ready
+      - trigger: homeassistant
+        event: start
+    conditions:
+      - condition: state
+        entity_id: input_boolean.mow_vpd_driven_live
+        state: 'on'
+      - condition: state
+        entity_id: input_select.mower_mode
+        state: Smart Start
+      - condition: state
+        entity_id: input_boolean.mammotion_intentionally_disabled
+        state: 'off'
+      # Mower free (not already mowing / mid-dispatch).
+      - condition: state
+        entity_id: binary_sensor.lawn_mower_active
+        state: 'off'
+      - condition: template
+        value_template: >-
+          {{ is_state('script.mow_the_front_yard','off')
+             and is_state('script.mow_the_backyard','off')
+             and is_state('script.mow_the_yard','off') }}
+      # No VPD mow already in flight (restart-resilient flag — survives the script dying).
+      - condition: state
+        entity_id: input_boolean.mow_vpd_mowing
+        state: 'off'
+      # Healthy + reachable (don't dispatch into a dead/again-recovering link).
+      # Gates on genuine FAULTS only — NOT binary_sensor.mower_needs_attention,
+      # which also flags blade-wear (a maintenance reminder that must NOT block an
+      # auto-mow). Real faults are caught by the Recovery-Failed check here + the
+      # mower_status line below. (2026-07-17, see mower.md §10.24.)
+      - condition: template
+        value_template: "{{ not is_state('sensor.mammotion_integration_status','Recovery Failed') }}"
+      # Block only on GENUINE faults. Dropped the telemetry-derived states
+      # offline/reconnecting/unavailable/unknown (2026-07-25, §10.28): during a
+      # firmware decode break those are FALSE alarms — commands still work — so a
+      # due-mow dispatch should proceed and let the mow script's §1 integration
+      # recover (reload) + plug-based confirm-start backstop a genuinely-down case.
+      # Rate-safe: only the ≤2 due mows/day reach here, and mow_vpd_mowing + the
+      # launch-marker prevent any re-dispatch loop.
+      - condition: template
+        value_template: "{{ states('sensor.mower_status') not in ['stuck','error'] }}"
+      # Rain fail-safe: skip if wet, actively raining, OR rain data unknown (treat unknown as wet).
+      - condition: template
+        value_template: >-
+          {% set veto = is_state('input_boolean.mow_rain_veto_enabled','on') %}
+          {% set wet = states('binary_sensor.mow_lawn_wet') in ['on','unknown','unavailable'] %}
+          {{ (not (veto and wet)) and is_state('binary_sensor.mow_rain_significant','off') }}
+      # NOTE: no global earliest here — each yard enforces its OWN floor
+      # (mow_earliest_front / mow_earliest_back) inside f_go/b_go below. The old
+      # whole-system mow_smart_earliest is now ONLY the fallback launcher's earliest
+      # (decoupled 2026-07-06 so it can't silently override the per-yard floors).
+    actions:
+      - variables:
+          f_go: >-
+            {% set fb = today_at(states('input_datetime.mow_smart_finish_by')) %}
+            {% set m = states('input_number.mow_smart_finish_margin_min') | float(5) %}
+            {% set buf = 1 + (states('input_number.mow_duration_buffer_pct') | float(15)) / 100 %}
+            {% set f_exp = states('sensor.mow_front_expected_min') | float(91) %}
+            {% set f_latest = fb - timedelta(minutes = m + f_exp * buf) %}
+            {% set due = is_state('binary_sensor.mow_front_due','on') %}
+            {% set ready = is_state('binary_sensor.mow_front_vpd_ready','on') %}
+            {% set gate = is_state('binary_sensor.gate','on') %}
+            {% set feas = now() <= f_latest %}
+            {% set earliest_ok = now() >= today_at(states('input_datetime.mow_earliest_front')) %}
+            {% set backstop = is_state('input_boolean.mow_backstop_enabled','on') %}
+            {% set over = states('sensor.mow_front_days_since') | float(0) >= states('input_number.mow_backstop_after_days') | float(4) %}
+            {% set ceiling = now() >= (f_latest - timedelta(minutes=3)) %}
+            {# earliest_ok wraps BOTH paths → the overdue-backstop also obeys the front floor.
+               Rain is handled by the dispatcher's global fail-safe above (blocks all dispatch). #}
+            {{ due and gate and earliest_ok and ( (ready and feas) or (backstop and over and ceiling and feas) ) }}
+          b_go: >-
+            {% set fb = today_at(states('input_datetime.mow_smart_finish_by')) %}
+            {% set m = states('input_number.mow_smart_finish_margin_min') | float(5) %}
+            {% set buf = 1 + (states('input_number.mow_duration_buffer_pct') | float(15)) / 100 %}
+            {% set b_exp = states('sensor.mow_back_expected_min') | float(98) %}
+            {% set b_latest = fb - timedelta(minutes = m + b_exp * buf) %}
+            {% set due = is_state('binary_sensor.mow_back_due','on') %}
+            {% set ready = is_state('binary_sensor.mow_back_vpd_ready','on') %}
+            {% set charged = is_state('binary_sensor.mower_charged','on') %}
+            {% set feas = now() <= b_latest %}
+            {% set earliest_ok = now() >= today_at(states('input_datetime.mow_earliest_back')) %}
+            {% set backstop = is_state('input_boolean.mow_backstop_enabled','on') %}
+            {% set over = states('sensor.mow_back_days_since') | float(0) >= states('input_number.mow_backstop_after_days') | float(4) %}
+            {% set ceiling = now() >= (b_latest - timedelta(minutes=3)) %}
+            {# earliest_ok wraps BOTH paths → the overdue-backstop also obeys the back floor.
+               Rain is handled by the dispatcher's global fail-safe above (blocks all dispatch). #}
+            {{ due and charged and earliest_ok and ( (ready and feas) or (backstop and over and ceiling and feas) ) }}
+      - choose:
+          # Front first (needs the gate + crosses VPD earlier; back follows after recharge).
+          - conditions: "{{ f_go }}"
+            sequence:
+              # Mark the yard handled NOW so a missed/late completion-stamp can never
+              # trigger a re-dispatch (re-stamped accurately on completion). Set the
+              # tracker + restart-resilient flag for the robust completion stamp.
+              - action: input_datetime.set_datetime
+                target: { entity_id: input_datetime.mow_front_yard_stop_time }
+                data: { datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}" }
+              - action: input_text.set_value
+                target: { entity_id: input_text.mow_active_yard }
+                data: { value: front }
+              - action: input_boolean.turn_on
+                target: { entity_id: input_boolean.mow_vpd_mowing }
+              - action: logbook.log
+                data:
+                  name: "VPD Mow Dispatcher"
+                  entity_id: automation.mow_vpd_driven_dispatcher
+                  message: "Dispatching the FRONT yard (VPD-driven)."
+              - action: script.turn_on
+                target: { entity_id: script.mow_the_front_yard }
+          - conditions: "{{ b_go }}"
+            sequence:
+              - action: input_datetime.set_datetime
+                target: { entity_id: input_datetime.mow_backyard_stop_time }
+                data: { datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}" }
+              - action: input_text.set_value
+                target: { entity_id: input_text.mow_active_yard }
+                data: { value: back }
+              - action: input_boolean.turn_on
+                target: { entity_id: input_boolean.mow_vpd_mowing }
+              - action: logbook.log
+                data:
+                  name: "VPD Mow Dispatcher"
+                  entity_id: automation.mow_vpd_driven_dispatcher
+                  message: "Dispatching the BACK yard (VPD-driven)."
+              - action: script.turn_on
+                target: { entity_id: script.mow_the_backyard }
+    mode: single
+
+  # --- Surface a SILENT auto-mow block — never a silent no-show (§10.24/§10.25) ------
+  - id: mow_smart_held_notify
+    alias: "Mow — Smart Held (surface silent blocks)"
+    description: >-
+      Posts ONE notification when auto-mow is genuinely, persistently held — a due yard past its
+      earliest floor, mower not mowing, and either integration recovery has FAILED or rain data is
+      unknown/wet. Edge-driven off the debounced binary_sensor.mow_smart_hold. Hardened 2026-07-26
+      (mower.md §10.31): the old version keyed on the FLAPPING sensor.mower_status / derived
+      'Recovery Failed' and re-fired persistent_notification.create every ~50s during the firmware
+      break (a push per flap, worse when deleted). Now one push per genuine hold episode; deleting
+      it does NOT re-push (no re-eval until the debounced sensor cycles). Self-clears when it lifts.
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.mow_smart_hold
+        from: 'off'
+        to: 'on'
+        id: held
+      - trigger: state
+        entity_id: binary_sensor.mow_smart_hold
+        to: 'off'
+        id: clear
+    conditions: []
+    actions:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: held
+            sequence:
+              - action: persistent_notification.create
+                data:
+                  notification_id: mow_smart_held
+                  title: "🚜 Smart Mow held — needs a look"
+                  message: >-
+                    A yard is due but auto-mow is paused.
+                    {% if is_state('input_select.mammotion_recovery_phase','failed') %} 📡 Integration recovery failed — open the Mammotion app to wake it.
+                    {% else %} 🌧️ Rain data is unavailable — holding as a wet-weather precaution; check the rain sensor.{% endif %}
+        default:
+          - action: persistent_notification.dismiss
+            data:
+              notification_id: mow_smart_held
+    mode: single
+
+  # --- Watchdog: clear a stuck VPD-mowing flag so it can't block future dispatches -
+  - id: mow_vpd_mowing_watchdog
+    alias: "Mow — VPD Mowing Flag Watchdog"
+    description: >-
+      Safety net: if `mow_vpd_mowing` is on but the mower isn't actually
+      mowing/returning/docking (e.g. a dispatch that never really started, or a
+      completion whose stamp trigger was somehow missed), clear the flag + tracker
+      so the dispatcher isn't blocked forever. Also runs on HA start.
+    triggers:
+      - trigger: state
+        entity_id: lawn_mower.luba_3
+        for: "00:03:00"
+      - trigger: homeassistant
+        event: start
+      - trigger: time_pattern
+        minutes: "/5"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.mow_vpd_mowing
+        state: 'on'
+      - condition: template
+        value_template: "{{ states('lawn_mower.luba_3') not in ['mowing','returning','docking'] }}"
+    actions:
+      - action: input_boolean.turn_off
+        target: { entity_id: input_boolean.mow_vpd_mowing }
+      - action: input_text.set_value
+        target: { entity_id: input_text.mow_active_yard }
+        data: { value: "" }
+    mode: single
+
+# =============================================================================
+# MANUAL OVERRIDE — force a mow at the next opportunity (defeat the cadence skip)
+# =============================================================================
+# Dashboard button (Per-Yard VPD Readiness card, Smart Start only). Backdates
+# BOTH yards' cadence clocks just past the cadence so each reads "due" again.
+# Deliberately does NOT touch VPD-ready / rain veto / earliest floors / finish-by
+# feasibility — the mower still only starts when it's genuinely safe & feasible,
+# so it mows TODAY if it still can, otherwise TOMORROW. Self-clearing: every real
+# mow re-stamps that yard's stop_time on completion.
+script:
+  mow_force_next_opportunity:
+    alias: "Mow — Force Next Opportunity (override skip)"
+    icon: mdi:calendar-alert
+    mode: single
+    sequence:
+      - variables:
+          backdate: >-
+            {% set cad = states('input_number.mow_cadence_days') | float(2) %}
+            {{ (now() - timedelta(days = cad + 0.25)).strftime('%Y-%m-%d %H:%M:%S') }}
+      - action: input_datetime.set_datetime
+        target:
+          entity_id:
+            - input_datetime.mow_front_yard_stop_time
+            - input_datetime.mow_backyard_stop_time
+        data:
+          datetime: "{{ backdate }}"
+      - action: logbook.log
+        data:
+          name: "VPD Mow"
+          entity_id: automation.mow_vpd_driven_dispatcher
+          message: >-
+            Manual override — both yards marked due. Will mow at the next
+            VPD-dry / earliest / feasible opportunity (today if possible, else tomorrow).

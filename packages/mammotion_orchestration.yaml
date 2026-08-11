@@ -1,0 +1,1184 @@
+# =============================================================================
+# mammotion_orchestration.yaml  —  multi-lawn mow ORCHESTRATION tier
+# =============================================================================
+# This is one piece of a small, resilient Home Assistant setup for Mammotion
+# robotic mowers (Luba / Luba 2 / Yuka, etc.). It is the "orchestration" layer:
+# the per-zone mow scripts, the whole-yard composer, the cancel/dock helper, the
+# phase-advance automations that walk a multi-lawn mow through its stages, and
+# the small set of helpers that hold that state across HA restarts.
+#
+# WITH DEEP GRATITUDE to the maintainers and contributors of the community
+# integration `mikey0000/Mammotion-HA` and the underlying `pymammotion` library.
+# Everything here is built ON TOP of their work — it only exists because they did
+# the hard part of talking to a closed, changing mower protocol and gave it away
+# for free. None of what follows is a criticism of the integration; the patterns
+# below are just a userspace way to ride out a couple of rough edges we hit in
+# our own install (mostly the zone-switch entity-id churn that happens when the
+# mower's map changes). Bugs in a free community integration for a moving target
+# are expected and understandable — thank you.
+#
+# -----------------------------------------------------------------------------
+# WHAT WE RUN (so you can judge how close your setup is to ours)
+# -----------------------------------------------------------------------------
+#   - Integration: mikey0000/Mammotion-HA  0.6.4-beta9
+#   - Library:     pymammotion 0.8.11
+#   - Mower:       Mammotion Luba 3
+#   - HA:          current (2026.x)
+# In our experience the beta9 -> beta11 delta is tiny and does NOT fix the
+# zone-switch churn, so we pin beta9 while the yard's map is actively changing.
+# That is our situation, not a recommendation against the maintainers — newer
+# betas may well be better for you.
+#
+# -----------------------------------------------------------------------------
+# DEPENDS ON: packages/mammotion_core.yaml  (install that FIRST)
+# -----------------------------------------------------------------------------
+# This file consumes, but does NOT define, these core entities:
+#   sensor.mower_status ............... one-word mower state (mowing/returning/
+#                                       error/stuck/ready/charging/offline...)
+#   binary_sensor.mower_charging ...... ON while docked; ON-edge = "task just
+#                                       finished / home", OFF-edge = "left dock".
+#                                       (We use its edges to detect zone finish.)
+#   binary_sensor.mower_charged ....... ON = docked AND battery high, held a few
+#                                       minutes (the "ready to mow" gate).
+#   binary_sensor.mammotion_integration_healthy .. ON = mower + all zone controls
+#                                       are available (the pre-command gate).
+#   binary_sensor.mow_area_back_lawn / _front_lawn_w / _front_lawn_e ..
+#                                       stable zone PROXIES. Each carries a
+#                                       `resolved_entity` attribute = the live
+#                                       zone switch it currently maps to (or '').
+#   script.mower_recover_integration .. reload-first recovery for the controls.
+#   input_boolean.mammotion_intentionally_disabled .. user "leave it alone" flag.
+# It also uses integration-provided entities under the `luba_3` slug (see below).
+#
+# -----------------------------------------------------------------------------
+# THE `luba_3` SLUG — RENAME TO MATCH YOUR MOWER
+# -----------------------------------------------------------------------------
+# Entities like `lawn_mower.luba_3`, `switch.luba_3_bluetooth`,
+# `button.luba_3_cancel_current_task`, `sensor.luba_3_battery`,
+# `sensor.luba_3_activity_mode` are created by the integration from YOUR mower's
+# device name. Ours is a Luba 3, so the slug is `luba_3`. Find yours under
+# Settings -> Devices & Services -> Mammotion, and do a search/replace of
+# `luba_3` throughout this file with your mower's slug.
+#
+# -----------------------------------------------------------------------------
+# OPTIONAL blocks (this file works with all of them removed)
+# -----------------------------------------------------------------------------
+#   * RAIN GATE (top of each mow script): honors the optional rain package
+#     `packages/mammotion_rain_gate.yaml` via `binary_sensor.mow_rain_veto` +
+#     `input_boolean.mow_rain_veto_enabled`. If you don't install that package
+#     those entities simply won't exist and the block stays inert (the state
+#     conditions are never true), so it is safe to leave in or delete.
+#   * OBSTACLE AVOIDANCE (per-yard): commented OUT by default because it needs
+#     extra helpers + the integration's obstacle select. Uncomment + define the
+#     helpers if you want per-zone obstacle behavior.
+#   * NOTIFICATIONS: we use plain `persistent_notification` here so the system is
+#     fully functional with NO voice layer. Everywhere our private config spoke
+#     on a Voice PE, you'll see a `# optional: your notification/announcement
+#     here` marker — wire your own voice/announce there if you want one.
+#   * CHARGE TRACKERS (bottom): purely informational "started charging" /
+#     "reached 80%" notifications. Optional; safe to delete.
+#
+# -----------------------------------------------------------------------------
+# SECRET
+# -----------------------------------------------------------------------------
+# `!secret mammotion_config_entry_id` (used by the backyard end-of-mow reload) is
+# the Mammotion config-entry id. To find it: open Settings -> Devices & Services
+# -> Mammotion, click the entry, and copy the long hex id from the browser URL
+# (.../config/integrations/integration/mammotion then the entry page — the
+# `config_entry/<ID>` segment). Add to secrets.yaml:
+#     mammotion_config_entry_id: "0123456789abcdef0123456789abcdef"
+# We keep it in secrets.yaml rather than inline as normal good practice.
+#
+# -----------------------------------------------------------------------------
+# THE PHASE MACHINE (what the automations below implement)
+# -----------------------------------------------------------------------------
+# `script.mow_the_yard` is a minimal LAUNCHER: it sets the orchestration flags,
+# clears the per-yard outcomes, sets phase = front_1, and fires the front-yard
+# script DETACHED — then exits immediately. It never waits inside itself. Every
+# transition after that is driven by event-based automations watching the
+# per-yard OUTCOME strings and the charge gate (no timeouts in the orchestrator).
+#
+#   idle
+#     -> front_1                     (front-yard mow in flight)
+#         front completed            -> charge_wait_for_back
+#         front failed               -> end (idle)
+#     charge_wait_for_back           : wait for binary_sensor.mower_charged edge
+#     -> back_after_front_ok         (backyard, front already done)
+#         back done                  -> end (idle): whole yard complete
+#         back failed                -> end (idle)
+#
+# Safety nets: a "zone finish fallback" infers an outcome if a per-yard script
+# is killed (HA restart / script.reload) mid-mow but the mower still returns, and
+# a "recovery on HA start" resumes the right phase after a restart.
+#
+# Cancel any time with script.mower_cancel_and_dock (wire it to a dashboard
+# button): it stops the scripts, cancels the mower task, docks, and WIPES the
+# orchestration state so the next run starts clean.
+#
+# -----------------------------------------------------------------------------
+# INSTALL
+# -----------------------------------------------------------------------------
+#   1. Make sure `homeassistant: packages: !include_dir_named packages` is set
+#      in configuration.yaml, and that mammotion_core.yaml is already loaded.
+#   2. Drop this file in `config/packages/`.
+#   3. Add `mammotion_config_entry_id` to secrets.yaml (see SECRET above).
+#   4. Search/replace the `luba_3` slug with your mower's slug.
+#   5. Restart HA once (new input_* helpers need a restart to register). After
+#      that, script + automation edits reload via Developer Tools -> YAML ->
+#      "Scripts" / "Automations" — but NOT while a mow script is mid-run, because
+#      script.reload cancels running scripts and would kill the completion
+#      bookkeeping. Defer reloads until the mower is docked.
+# =============================================================================
+
+
+# =============================================================================
+# SECTION 1: Orchestration helpers (state that survives HA restarts)
+# =============================================================================
+input_boolean:
+  # Master "a whole-yard orchestration is running" flag. Set ON by
+  # script.mow_the_yard, cleared by whichever advance automation ends the run
+  # (or by the cancel script). No `initial:` -> it survives HA restarts at its
+  # last value, so the recovery automation can pick the run back up.
+  mow_yard_active:
+    name: Mow Yard Active
+    icon: mdi:robot-mower-outline
+
+input_select:
+  # The orchestration's current phase. Persists across restarts (no `initial:`)
+  # so recovery can resume by phase. See "THE PHASE MACHINE" in the header.
+  mow_yard_phase:
+    name: Mow Yard Phase
+    icon: mdi:state-machine
+    options:
+      - idle
+      - front_1
+      - charge_wait_for_back
+      - back_after_front_ok
+
+input_datetime:
+  # Per-yard start/stop stamps. STORED datetimes so a mid-mow HA restart doesn't
+  # lose them (unlike a state's last_changed, which resets to the restart time).
+  # The duration is computed from start -> stop, so keeping these restart-proof
+  # keeps the duration honest even if the script dies and the fallback finishes.
+  mow_backyard_start_time:
+    name: Mow Backyard Start Time
+    has_date: true
+    has_time: true
+    icon: mdi:robot-mower
+  mow_backyard_stop_time:
+    name: Mow Backyard Stop Time
+    has_date: true
+    has_time: true
+    icon: mdi:robot-mower
+  mow_front_yard_start_time:
+    name: Mow Front Yard Start Time
+    has_date: true
+    has_time: true
+    icon: mdi:robot-mower
+  mow_front_yard_stop_time:
+    name: Mow Front Yard Stop Time
+    has_date: true
+    has_time: true
+    icon: mdi:robot-mower
+
+  # Whole-yard orchestration start stamp (for a total-elapsed readout that also
+  # survives a mid-mow restart). Optional; nothing here depends on it.
+  mow_yard_started_at:
+    name: Mow Yard Started At
+    has_date: true
+    has_time: true
+    icon: mdi:robot-mower
+
+  # Used only by the OPTIONAL charge-start tracker at the bottom of this file.
+  luba_charge_start_time:
+    name: Luba Charge Start Time
+    has_date: true
+    has_time: true
+    icon: mdi:battery-clock
+
+input_text:
+  # Human-readable per-yard durations (e.g. "42m", "1h 5m"), written by the
+  # scripts / fallback. Handy for a dashboard; not part of the state machine.
+  mow_backyard_duration:
+    name: Mow Backyard Duration
+    max: 50
+    icon: mdi:robot-mower
+  mow_front_yard_duration:
+    name: Mow Front Yard Duration
+    max: 50
+    icon: mdi:robot-mower
+
+  # THE per-yard OUTCOME strings — the signal the whole phase machine advances
+  # on. Values: "" / running / completed / ended_early / not_ready /
+  # failed_integration / failed / skipped_rain.
+  # A per-yard script sets these; the advance automations trigger off them.
+  mow_front_outcome:
+    name: Mow Front Outcome
+    max: 30
+    icon: mdi:flag-checkered
+  mow_back_outcome:
+    name: Mow Back Outcome
+    max: 30
+    icon: mdi:flag-checkered
+
+
+# =============================================================================
+# SECTION 2: Scripts
+# =============================================================================
+script:
+
+  # ---------------------------------------------------------------------------
+  # mow_the_backyard — mow one zone (the back lawn), verified end to end.
+  # ---------------------------------------------------------------------------
+  # Flow: (optional rain gate) -> integration gate (recover if unhealthy) ->
+  # ride out the mower_charged settle -> ready gate -> Bluetooth + select ONLY
+  # the back-lawn zone (resolved via the stable proxy) -> start + confirm it
+  # actually left the dock -> release BLE -> wait for real return -> record
+  # duration + outcome -> reload the integration once at the dock (the mow drives
+  # the mower out of BLE range, which can drop the zone control switches; a
+  # reload at the dock restores HA control). Cancellation is handled separately
+  # by script.mower_cancel_and_dock.
+  mow_the_backyard:
+    alias: Mow the Backyard
+    icon: mdi:robot-mower
+    mode: single
+    sequence:
+    - action: input_text.set_value
+      target:
+        entity_id: input_text.mow_back_outcome
+      data:
+        value: running
+    # === OPTIONAL rain gate ==================================================
+    # Skip if the optional rain package says it's too wet to start. If you did
+    # not install packages/mammotion_rain_gate.yaml, binary_sensor.mow_rain_veto
+    # and input_boolean.mow_rain_veto_enabled won't exist and this block never
+    # fires (the state conditions are never 'on'). Delete it if you don't want a
+    # rain gate at all.
+    - if:
+      - condition: state
+        entity_id: input_boolean.mow_rain_veto_enabled
+        state: 'on'
+      - condition: state
+        entity_id: binary_sensor.mow_rain_veto
+        state: 'on'
+      then:
+      # End the orchestration FIRST (if active) so the advance automations don't
+      # fire on the skipped_rain outcome we're about to set.
+      - if:
+        - condition: state
+          entity_id: input_boolean.mow_yard_active
+          state: 'on'
+        then:
+        - action: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.mow_yard_active
+        - action: input_select.select_option
+          target:
+            entity_id: input_select.mow_yard_phase
+          data:
+            option: idle
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.mow_back_outcome
+        data:
+          value: skipped_rain
+      - action: persistent_notification.create
+        data:
+          title: "Mower — Backyard Skipped (rain)"
+          notification_id: mow_yard
+          message: "{{ now().strftime('%-I:%M %p, %A, %B %-d') }} — It's too wet to start the backyard mow. Skipping the rest for today."
+      # optional: your notification/announcement here
+      - stop: "Rain — backyard skipped"
+    # === end optional rain gate ==============================================
+    # 1. Integration gate — recover the controls if they aren't healthy.
+    - if:
+      - condition: state
+        entity_id: binary_sensor.mammotion_integration_healthy
+        state: 'off'
+      then:
+      - action: script.mower_recover_integration
+      - if:
+        - condition: state
+          entity_id: binary_sensor.mammotion_integration_healthy
+          state: 'off'
+        then:
+        - action: input_text.set_value
+          target:
+            entity_id: input_text.mow_back_outcome
+          data:
+            value: failed_integration
+        - stop: Integration not recoverable
+    # 1b. Ride out the mower_charged settle. binary_sensor.mower_charged has a
+    #     ~5-min delay_on; that clock also restarts on a manual re-enable, an HA
+    #     restart, or a self-healed blip. This wait returns INSTANTLY if
+    #     mower_charged is already on (the happy path costs nothing) and only
+    #     waits when the mower is genuinely ready but the timer hasn't latched.
+    - wait_template: "{{ is_state('binary_sensor.mower_charged','on') }}"
+      timeout: '00:05:30'
+      continue_on_timeout: true
+    # 2. Ready gate (docked + charged).
+    - if:
+      - condition: state
+        entity_id: binary_sensor.mower_charged
+        state: 'off'
+      then:
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.mow_back_outcome
+        data:
+          value: not_ready
+      - stop: Mower not ready
+    # 3. Bluetooth + select the back-lawn zone ONLY. Resolve the live zone
+    #    switches through the stable proxies' resolved_entity attribute, so a
+    #    map-change entity-id churn doesn't break us.
+    - variables:
+        zone_back: "{{ state_attr('binary_sensor.mow_area_back_lawn','resolved_entity') | default('') }}"
+        zone_fw: "{{ state_attr('binary_sensor.mow_area_front_lawn_w','resolved_entity') | default('') }}"
+        zone_fe: "{{ state_attr('binary_sensor.mow_area_front_lawn_e','resolved_entity') | default('') }}"
+    - action: switch.turn_on
+      target:
+        entity_id: switch.luba_3_bluetooth
+    - wait_template: "{{ states('sensor.luba_3_connection') in ['BLE', 'WIFI/BLE'] }}"
+      timeout: '00:00:30'
+      continue_on_timeout: true
+    - action: switch.turn_off
+      target:
+        entity_id:
+        - "{{ zone_fw }}"
+        - "{{ zone_fe }}"
+    - action: switch.turn_on
+      target:
+        entity_id: "{{ zone_back }}"
+    - delay:
+        seconds: 5
+    - wait_template: >-
+        {{ is_state(zone_back, 'on') and is_state(zone_fw, 'off') and is_state(zone_fe, 'off') }}
+      timeout: '00:00:10'
+      continue_on_timeout: true
+    - if:
+      - condition: template
+        value_template: "{{ not (is_state(zone_back,'on') and is_state(zone_fw,'off') and is_state(zone_fe,'off')) }}"
+      then:
+      - action: switch.turn_off
+        target:
+          entity_id: switch.luba_3_bluetooth
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.mow_back_outcome
+        data:
+          value: failed
+      - stop: Area not selected
+    # === OPTIONAL per-yard obstacle avoidance ================================
+    # Uncomment and define input_select.mow_back_obstacle_detection (options
+    # Off/Standard/Sensitive) if you want to set the integration's obstacle
+    # behavior per zone before starting. Left out by default so this script has
+    # no extra helper dependencies.
+    # - action: select.select_option
+    #   target:
+    #     entity_id: select.luba_3_obstacle_detection
+    #   data:
+    #     option: >-
+    #       {{ {'Off':'direct_touch','Standard':'no_touch','Sensitive':'sensitive'}.get(states('input_select.mow_back_obstacle_detection'),'direct_touch') }}
+    # === end optional obstacle avoidance =====================================
+    # 4. Start mowing; confirm it actually left the dock (verified via the core
+    #    signals, not a blind "we sent the command").
+    - action: lawn_mower.start_mowing
+      target:
+        entity_id: lawn_mower.luba_3
+    - wait_template: "{{ is_state('binary_sensor.mower_charging','off') or is_state('sensor.mower_status','mowing') }}"
+      timeout: '00:02:30'
+      continue_on_timeout: true
+    - if:
+      - condition: template
+        value_template: "{{ is_state('binary_sensor.mower_charging','on') and not is_state('sensor.mower_status','mowing') }}"
+      then:
+      - action: switch.turn_off
+        target:
+          entity_id: switch.luba_3_bluetooth
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.mow_back_outcome
+        data:
+          value: failed
+      - stop: Did not start mowing
+    # Record start, release BLE so the phone app can connect.
+    - action: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.mow_backyard_start_time
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+    - delay:
+        seconds: 5
+    - action: switch.turn_off
+      target:
+        entity_id: switch.luba_3_bluetooth
+    # 5. Wait for the zone to complete. TWO-STEP to dodge a latch race:
+    #    binary_sensor.mower_charging has delay_off:10s, so it stays ON for ~10s
+    #    after the mower physically leaves the dock. A naive "is it ON?" check
+    #    fires immediately and reports a bogus "complete" seconds into the mow.
+    #    Fix: wait for the OFF edge first (proves it actually departed), THEN the
+    #    ON edge (real return). error/stuck short-circuits both waits.
+    - wait_template: "{{ is_state('binary_sensor.mower_charging','off') or states('sensor.mower_status') in ['error','stuck'] }}"
+      timeout: '00:02:00'
+      continue_on_timeout: true
+    - wait_template: "{{ is_state('binary_sensor.mower_charging','on') or states('sensor.mower_status') in ['error','stuck'] }}"
+    - action: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.mow_backyard_stop_time
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+    - variables:
+        total_seconds: "{{ (as_timestamp(now()) - as_timestamp(states('input_datetime.mow_backyard_start_time'), 0)) | int }}"
+        hours: "{{ (total_seconds // 3600) | int }}"
+        minutes: "{{ ((total_seconds % 3600) // 60) | int }}"
+        duration_str: "{% if hours > 0 %}{{ hours }}h {{ minutes }}m{% else %}{{ minutes }}m{% endif %}"
+    - action: input_text.set_value
+      target:
+        entity_id: input_text.mow_backyard_duration
+      data:
+        value: "{{ duration_str }}"
+    # 6. Outcome (read by the orchestrator + any notification/voice layer).
+    - action: input_text.set_value
+      target:
+        entity_id: input_text.mow_back_outcome
+      data:
+        value: "{{ 'ended_early' if states('sensor.mower_status') in ['error','stuck'] else 'completed' }}"
+    # optional: your notification/announcement here (completed vs ended_early)
+    # 7. End-of-mow integration reload. The backyard mow can drive the mower out
+    #    of BLE-proxy range, dropping sensor.luba_3_connection to WiFi-only and
+    #    taking the BLE-bound zone switches unavailable; in our experience they
+    #    don't come back at the dock on their own — a reload restores them. We're
+    #    docked now (BLE back in range), so reload ONCE. Direct reload, NOT the
+    #    recovery script (whose failure path is noisier). Skipped if already
+    #    healthy or if the integration is intentionally disabled.
+    - if:
+      - condition: state
+        entity_id: binary_sensor.mammotion_integration_healthy
+        state: 'off'
+      - condition: state
+        entity_id: input_boolean.mammotion_intentionally_disabled
+        state: 'off'
+      then:
+      - wait_template: "{{ 'BLE' in states('sensor.luba_3_connection') }}"
+        timeout: '00:01:30'
+        continue_on_timeout: true
+      - action: homeassistant.reload_config_entry
+        data:
+          entry_id: !secret mammotion_config_entry_id
+      - wait_template: "{{ is_state('binary_sensor.mammotion_integration_healthy','on') }}"
+        timeout: '00:02:00'
+        continue_on_timeout: true
+      - if:
+        - condition: state
+          entity_id: binary_sensor.mammotion_integration_healthy
+          state: 'on'
+        then:
+        - action: logbook.log
+          data:
+            name: Mower
+            entity_id: lawn_mower.luba_3
+            message: "Backyard mow done — integration reloaded at dock, zone controls restored."
+        else:
+        - action: persistent_notification.create
+          data:
+            title: "Mower — Controls Still Down After Reload"
+            message: "{{ now().strftime('%-I:%M %p, %A, %B %-d') }} — Reloaded the Mammotion integration after the backyard mow, but the zone control switches didn't come back. HA can't command the mower until it recovers."
+
+  # ---------------------------------------------------------------------------
+  # mow_the_front_yard — mow the front (west + east zones), verified end to end.
+  # ---------------------------------------------------------------------------
+  # Same shape as the backyard script, just selecting the front-lawn W + E zones
+  # instead of the back lawn.
+  mow_the_front_yard:
+    alias: Mow the Front Yard
+    icon: mdi:robot-mower
+    mode: single
+    sequence:
+    - action: input_text.set_value
+      target:
+        entity_id: input_text.mow_front_outcome
+      data:
+        value: running
+    # === OPTIONAL rain gate (see the backyard script for the full note) ======
+    - if:
+      - condition: state
+        entity_id: input_boolean.mow_rain_veto_enabled
+        state: 'on'
+      - condition: state
+        entity_id: binary_sensor.mow_rain_veto
+        state: 'on'
+      then:
+      - if:
+        - condition: state
+          entity_id: input_boolean.mow_yard_active
+          state: 'on'
+        then:
+        - action: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.mow_yard_active
+        - action: input_select.select_option
+          target:
+            entity_id: input_select.mow_yard_phase
+          data:
+            option: idle
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.mow_front_outcome
+        data:
+          value: skipped_rain
+      - action: persistent_notification.create
+        data:
+          title: "Mower — Front Yard Skipped (rain)"
+          notification_id: mow_yard
+          message: "{{ now().strftime('%-I:%M %p, %A, %B %-d') }} — It's too wet to start the front yard mow. Skipping the rest for today."
+      # optional: your notification/announcement here
+      - stop: "Rain — front yard skipped"
+    # === end optional rain gate ==============================================
+    # 1. Integration gate — recover the controls if they aren't healthy.
+    - if:
+      - condition: state
+        entity_id: binary_sensor.mammotion_integration_healthy
+        state: 'off'
+      then:
+      - action: script.mower_recover_integration
+      - if:
+        - condition: state
+          entity_id: binary_sensor.mammotion_integration_healthy
+          state: 'off'
+        then:
+        - action: input_text.set_value
+          target:
+            entity_id: input_text.mow_front_outcome
+          data:
+            value: failed_integration
+        - stop: Integration not recoverable
+    # 1b. Ride out the mower_charged settle (see the backyard script's note).
+    - wait_template: "{{ is_state('binary_sensor.mower_charged','on') }}"
+      timeout: '00:05:30'
+      continue_on_timeout: true
+    # 2. Ready gate (docked + charged).
+    - if:
+      - condition: state
+        entity_id: binary_sensor.mower_charged
+        state: 'off'
+      then:
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.mow_front_outcome
+        data:
+          value: not_ready
+      - stop: Mower not ready
+    # 3. Bluetooth + select the front-lawn W + E zones (resolve via the proxies).
+    - variables:
+        zone_back: "{{ state_attr('binary_sensor.mow_area_back_lawn','resolved_entity') | default('') }}"
+        zone_fw: "{{ state_attr('binary_sensor.mow_area_front_lawn_w','resolved_entity') | default('') }}"
+        zone_fe: "{{ state_attr('binary_sensor.mow_area_front_lawn_e','resolved_entity') | default('') }}"
+    - action: switch.turn_on
+      target:
+        entity_id: switch.luba_3_bluetooth
+    - wait_template: "{{ states('sensor.luba_3_connection') in ['BLE', 'WIFI/BLE'] }}"
+      timeout: '00:00:30'
+      continue_on_timeout: true
+    - action: switch.turn_off
+      target:
+        entity_id: "{{ zone_back }}"
+    - action: switch.turn_on
+      target:
+        entity_id:
+        - "{{ zone_fw }}"
+        - "{{ zone_fe }}"
+    - delay:
+        seconds: 5
+    - wait_template: >-
+        {{ is_state(zone_fw, 'on') and is_state(zone_fe, 'on') and is_state(zone_back, 'off') }}
+      timeout: '00:00:10'
+      continue_on_timeout: true
+    - if:
+      - condition: template
+        value_template: "{{ not (is_state(zone_fw,'on') and is_state(zone_fe,'on') and is_state(zone_back,'off')) }}"
+      then:
+      - action: switch.turn_off
+        target:
+          entity_id: switch.luba_3_bluetooth
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.mow_front_outcome
+        data:
+          value: failed
+      - stop: Area not selected
+    # === OPTIONAL per-yard obstacle avoidance (see backyard script) ==========
+    # - action: select.select_option
+    #   target:
+    #     entity_id: select.luba_3_obstacle_detection
+    #   data:
+    #     option: >-
+    #       {{ {'Off':'direct_touch','Standard':'no_touch','Sensitive':'sensitive'}.get(states('input_select.mow_front_obstacle_detection'),'no_touch') }}
+    # === end optional obstacle avoidance =====================================
+    # 4. Start mowing; confirm it actually left the dock.
+    - action: lawn_mower.start_mowing
+      target:
+        entity_id: lawn_mower.luba_3
+    - wait_template: "{{ is_state('binary_sensor.mower_charging','off') or is_state('sensor.mower_status','mowing') }}"
+      timeout: '00:02:30'
+      continue_on_timeout: true
+    - if:
+      - condition: template
+        value_template: "{{ is_state('binary_sensor.mower_charging','on') and not is_state('sensor.mower_status','mowing') }}"
+      then:
+      - action: switch.turn_off
+        target:
+          entity_id: switch.luba_3_bluetooth
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.mow_front_outcome
+        data:
+          value: failed
+      - stop: Did not start mowing
+    # Record start, release BLE.
+    - action: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.mow_front_yard_start_time
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+    - delay:
+        seconds: 5
+    - action: switch.turn_off
+      target:
+        entity_id: switch.luba_3_bluetooth
+    # 5. Wait for completion (two-step latch-race guard; see backyard script).
+    - wait_template: "{{ is_state('binary_sensor.mower_charging','off') or states('sensor.mower_status') in ['error','stuck'] }}"
+      timeout: '00:02:00'
+      continue_on_timeout: true
+    - wait_template: "{{ is_state('binary_sensor.mower_charging','on') or states('sensor.mower_status') in ['error','stuck'] }}"
+    - action: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.mow_front_yard_stop_time
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+    - variables:
+        total_seconds: "{{ (as_timestamp(now()) - as_timestamp(states('input_datetime.mow_front_yard_start_time'), 0)) | int }}"
+        hours: "{{ (total_seconds // 3600) | int }}"
+        minutes: "{{ ((total_seconds % 3600) // 60) | int }}"
+        duration_str: "{% if hours > 0 %}{{ hours }}h {{ minutes }}m{% else %}{{ minutes }}m{% endif %}"
+    - action: input_text.set_value
+      target:
+        entity_id: input_text.mow_front_yard_duration
+      data:
+        value: "{{ duration_str }}"
+    # 6. Outcome.
+    - action: input_text.set_value
+      target:
+        entity_id: input_text.mow_front_outcome
+      data:
+        value: "{{ 'ended_early' if states('sensor.mower_status') in ['error','stuck'] else 'completed' }}"
+    # optional: your notification/announcement here (completed vs ended_early)
+
+  # ---------------------------------------------------------------------------
+  # mow_the_yard — whole-yard LAUNCHER (front + back composed).
+  # ---------------------------------------------------------------------------
+  # Deliberately minimal: it sets the orchestration flags, clears the per-yard
+  # outcomes, sets phase = front_1, and fires the front-yard script DETACHED,
+  # then EXITS IMMEDIATELY. It never waits inside itself. The advance automations
+  # below drive every transition from there, off the outcome strings + the charge
+  # gate. Cancel via script.mower_cancel_and_dock.
+  mow_the_yard:
+    alias: Mow the Yard
+    icon: mdi:robot-mower
+    mode: single
+    sequence:
+    # Collision guard — refuse to launch on top of a mow already in flight.
+    - if:
+      - condition: template
+        value_template: >-
+          {{ is_state('input_boolean.mow_yard_active','on')
+             or is_state('script.mow_the_front_yard','on')
+             or is_state('script.mow_the_backyard','on')
+             or states('sensor.mower_status') in ['starting','mowing','returning','paused'] }}
+      then:
+      - stop: Mow already in progress
+    # Clear the outcome flags BEFORE setting the phase, so the advance automations
+    # can't fire on a stale terminal value from a previous run.
+    - action: input_text.set_value
+      target:
+        entity_id: input_text.mow_front_outcome
+      data:
+        value: ""
+    - action: input_text.set_value
+      target:
+        entity_id: input_text.mow_back_outcome
+      data:
+        value: ""
+    # Stamp the orchestration start as a STORED timestamp (restart-proof).
+    - action: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.mow_yard_started_at
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+    - action: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.mow_yard_active
+    - action: input_select.select_option
+      target:
+        entity_id: input_select.mow_yard_phase
+      data:
+        option: front_1
+    # optional: if you run a voice layer, hand it the target device here before
+    # launching (our private config copied the orchestration's source satellite
+    # into a per-yard input_text so the detached script announced on the right
+    # device). Voice-free installs skip it entirely.
+    # Fire the front-yard script DETACHED so this launcher exits immediately.
+    - action: script.turn_on
+      target:
+        entity_id: script.mow_the_front_yard
+
+  # ---------------------------------------------------------------------------
+  # mower_cancel_and_dock — stop everything and bring the mower home.
+  # ---------------------------------------------------------------------------
+  # Stops the per-yard + orchestration scripts (so a half-finished run doesn't
+  # log a false completion), cancels the current Mammotion task, then calls
+  # lawn_mower.dock (the command that actually returns the mower from a cancelled
+  # state), and WIPES the orchestration state so the phase-advance automations
+  # stop and the next run starts clean. Wire this to a dashboard "Cancel & Dock"
+  # button, shown whenever binary_sensor.lawn_mower_active is on.
+  mower_cancel_and_dock:
+    alias: Mower Cancel and Dock
+    icon: mdi:home-import-outline
+    mode: single
+    sequence:
+    - variables:
+        active_yard: "{% if is_state('script.mow_the_front_yard','on') %}front yard{% elif is_state('script.mow_the_backyard','on') %}backyard{% else %}{% endif %}"
+    - action: script.turn_off
+      target:
+        entity_id:
+        - script.mow_the_front_yard
+        - script.mow_the_backyard
+        - script.mow_the_yard
+    - action: button.press
+      target:
+        entity_id: button.luba_3_cancel_current_task
+    - delay:
+        seconds: 3
+    - action: lawn_mower.dock
+      target:
+        entity_id: lawn_mower.luba_3
+    - action: persistent_notification.create
+      data:
+        title: "Mower — Mow Cancelled"
+        notification_id: mow_cancelled
+        message: "{{ now().strftime('%-I:%M %p, %A, %B %-d') }} — The {{ active_yard if active_yard else 'mow' }} was cancelled. The mower is returning to its dock."
+    # optional: your notification/announcement here
+    # --- Orchestration cleanup (if a whole-yard run was active) --------------
+    - if:
+      - condition: state
+        entity_id: input_boolean.mow_yard_active
+        state: 'on'
+      then:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.mow_yard_active
+      - action: input_select.select_option
+        target:
+          entity_id: input_select.mow_yard_phase
+        data:
+          option: idle
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: mow_yard
+
+
+# =============================================================================
+# SECTION 3: Phase-advance automations (the state machine)
+# =============================================================================
+# These walk a whole-yard run through its phases by watching the per-yard OUTCOME
+# strings and the charge gate. There are NO timeouts in the orchestration itself
+# — every step is an event edge, so a slow charge or a long mow can't time it out.
+automation:
+
+  # 1. Front done -> branch on outcome.
+  #    completed   -> charge_wait_for_back (charge_ready fires the backyard)
+  #    any failure -> end the orchestration.
+  - id: mow_yard_advance_after_front_1
+    alias: Mow Yard — Advance After Front 1
+    description: >-
+      Event-driven advance. Triggers when input_text.mow_front_outcome changes to
+      a TERMINAL value (anything other than '' / running / unknown / unavailable)
+      while phase = front_1. Outcome-based, so it never mis-advances on a racy
+      device-state edge.
+    triggers:
+    - trigger: state
+      entity_id: input_text.mow_front_outcome
+      not_to:
+      - ''
+      - running
+      - unknown
+      - unavailable
+    conditions:
+    - condition: state
+      entity_id: input_boolean.mow_yard_active
+      state: 'on'
+    - condition: state
+      entity_id: input_select.mow_yard_phase
+      state: front_1
+    actions:
+    - choose:
+      # Path A — front mowed OK: wait for charge before the backyard.
+      - conditions:
+        - condition: state
+          entity_id: input_text.mow_front_outcome
+          state: completed
+        sequence:
+        - action: input_select.select_option
+          target:
+            entity_id: input_select.mow_yard_phase
+          data:
+            option: charge_wait_for_back
+        - action: persistent_notification.create
+          data:
+            title: "Mow All Lawns — Front Complete, Charging"
+            notification_id: mow_yard
+            message: '{{ now().strftime(''%-I:%M %p, %A, %B %-d'') }} — Front yard mow complete. Waiting for the mower to charge before starting the backyard.'
+      # Any failure on the front yard -> end the orchestration here.
+      default:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.mow_yard_active
+      - action: input_select.select_option
+        target:
+          entity_id: input_select.mow_yard_phase
+        data:
+          option: idle
+      - action: persistent_notification.create
+        data:
+          title: "Mow All Lawns — Front Yard Failed"
+          notification_id: mow_yard
+          message: '{{ now().strftime(''%-I:%M %p, %A, %B %-d'') }} — Front yard mow ended with outcome: {{ states(''input_text.mow_front_outcome'') }}. Mow All Lawns is stopping.'
+    mode: single
+
+  # 2. Charge gate -> launch the next mow. The single biggest win over a
+  #    synchronous orchestrator: NO timeout here. Fires on the OFF->ON edge of
+  #    binary_sensor.mower_charged while a charge-wait phase is active, so the
+  #    mower can take any amount of time to charge.
+  - id: mow_yard_charge_ready
+    alias: Mow Yard — Charge Ready
+    description: >-
+      Waits for binary_sensor.mower_charged to go ON during a charge_wait phase,
+      then launches the next mow. Clears the relevant outcome before launching so
+      the next advance triggers cleanly (and not on a stale value).
+    triggers:
+    - trigger: state
+      entity_id: binary_sensor.mower_charged
+      to: 'on'
+    conditions:
+    - condition: state
+      entity_id: input_boolean.mow_yard_active
+      state: 'on'
+    - condition: state
+      entity_id: input_select.mow_yard_phase
+      state: charge_wait_for_back
+    actions:
+    # NOTE: our private config also had an optional "finish-by feasibility" skip
+    # here for scheduled runs (don't start a half that can't finish before a
+    # deadline). That belongs to a scheduling layer with its own helpers and is
+    # intentionally omitted from this generic orchestration file.
+    # Clear the backyard outcome before launching so the next advance triggers
+    # cleanly (and not on a stale value).
+    - action: input_text.set_value
+      target:
+        entity_id: input_text.mow_back_outcome
+      data:
+        value: ""
+    - action: input_select.select_option
+      target:
+        entity_id: input_select.mow_yard_phase
+      data:
+        option: back_after_front_ok
+    - action: persistent_notification.create
+      data:
+        title: "Mow All Lawns — Starting Backyard"
+        notification_id: mow_yard
+        message: '{{ now().strftime(''%-I:%M %p, %A, %B %-d'') }} — Mower is charged. Starting the backyard mow.'
+    # optional: your notification/announcement here
+    - action: script.turn_on
+      target:
+        entity_id: script.mow_the_backyard
+    mode: single
+
+  # 3. Backyard done -> finish the run.
+  #    failure -> end the orchestration
+  #    done    -> whole yard complete
+  - id: mow_yard_advance_after_back
+    alias: Mow Yard — Advance After Back
+    description: >-
+      Event-driven advance on input_text.mow_back_outcome reaching a TERMINAL
+      value while phase is a backyard phase. Owns the state transitions only.
+    triggers:
+    - trigger: state
+      entity_id: input_text.mow_back_outcome
+      not_to:
+      - ''
+      - running
+      - unknown
+      - unavailable
+    conditions:
+    - condition: state
+      entity_id: input_boolean.mow_yard_active
+      state: 'on'
+    - condition: state
+      entity_id: input_select.mow_yard_phase
+      state: back_after_front_ok
+    actions:
+    - choose:
+      # Backyard failed -> end here.
+      - conditions:
+        - condition: template
+          value_template: "{{ states('input_text.mow_back_outcome') in ['failed','failed_integration','not_ready'] }}"
+        sequence:
+        - action: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.mow_yard_active
+        - action: input_select.select_option
+          target:
+            entity_id: input_select.mow_yard_phase
+          data:
+            option: idle
+        - action: persistent_notification.create
+          data:
+            title: "Mow All Lawns — Backyard Failed"
+            notification_id: mow_yard
+            message: '{{ now().strftime(''%-I:%M %p, %A, %B %-d'') }} — Backyard mow ended with outcome: {{ states(''input_text.mow_back_outcome'') }}. Mow All Lawns is stopping.'
+      # Backyard done -> fully done.
+      default:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.mow_yard_active
+      - action: input_select.select_option
+        target:
+          entity_id: input_select.mow_yard_phase
+        data:
+          option: idle
+      - action: persistent_notification.create
+        data:
+          title: "Mow All Lawns — Complete"
+          notification_id: mow_yard
+          message: '{{ now().strftime(''%-I:%M %p, %A, %B %-d'') }} — Mow All Lawns is complete. Both the front yard and the backyard were mowed.'
+      # optional: your notification/announcement here (completion)
+    mode: single
+
+  # 4. Safety net — infer an outcome if a per-yard script was KILLED mid-mow
+  #    (HA restart / script.reload) but the mower still physically finished and
+  #    returned. Watches binary_sensor.mower_charging OFF->ON while an active
+  #    mowing phase is set AND the relevant script is OFF (proves it's gone). In
+  #    normal operation this also fires, but the "script is off" condition fails
+  #    (the script is still running its own done-wait), so it's purely a net.
+  - id: mow_yard_zone_finish_fallback
+    alias: Mow Yard — Zone Finish Fallback
+    description: >-
+      Prevents a stuck orchestration when a per-yard script dies but the mow
+      completes. Infers completed/ended_early from sensor.mower_status and writes
+      the outcome + a restart-proof duration; the normal advance then takes over.
+    triggers:
+    - trigger: state
+      entity_id: binary_sensor.mower_charging
+      to: 'on'
+      from: 'off'
+    conditions:
+    - condition: state
+      entity_id: input_boolean.mow_yard_active
+      state: 'on'
+    - condition: template
+      value_template: "{{ states('input_select.mow_yard_phase') in ['front_1', 'back_after_front_ok'] }}"
+    # Only if the relevant per-yard script is OFF (proves it was killed).
+    - condition: template
+      value_template: >-
+        {% set phase = states('input_select.mow_yard_phase') %}
+        {% if phase == 'front_1' %}
+          {{ is_state('script.mow_the_front_yard', 'off') }}
+        {% else %}
+          {{ is_state('script.mow_the_backyard', 'off') }}
+        {% endif %}
+    # Only if the outcome hasn't already been set.
+    - condition: template
+      value_template: >-
+        {% set phase = states('input_select.mow_yard_phase') %}
+        {% if phase == 'front_1' %}
+          {{ states('input_text.mow_front_outcome') in ['', 'running'] }}
+        {% else %}
+          {{ states('input_text.mow_back_outcome') in ['', 'running'] }}
+        {% endif %}
+    actions:
+    - choose:
+      - conditions:
+        - condition: state
+          entity_id: input_select.mow_yard_phase
+          state: front_1
+        sequence:
+        - action: persistent_notification.create
+          data:
+            title: "Mow Yard — Inferring Front Outcome (Script Died)"
+            notification_id: mow_yard
+            message: '{{ now().strftime(''%-I:%M %p, %A, %B %-d'') }} — Detected mower return without a live front-yard script. Inferring outcome as {{ ''ended_early'' if states(''sensor.mower_status'') in [''error'',''stuck''] else ''completed'' }}.'
+        - action: input_datetime.set_datetime
+          target:
+            entity_id: input_datetime.mow_front_yard_stop_time
+          data:
+            datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+        - variables:
+            dur_secs: "{{ (as_timestamp(now()) - as_timestamp(states('input_datetime.mow_front_yard_start_time'), 0)) | int }}"
+        - if: "{{ dur_secs > 0 }}"
+          then:
+          - action: input_text.set_value
+            target:
+              entity_id: input_text.mow_front_yard_duration
+            data:
+              value: >-
+                {% set h = dur_secs // 3600 %}{% set m = (dur_secs % 3600) // 60 %}{% if h > 0 %}{{ h }}h {{ m }}m{% else %}{{ m }}m{% endif %}
+        - action: input_text.set_value
+          target:
+            entity_id: input_text.mow_front_outcome
+          data:
+            value: "{{ 'ended_early' if states('sensor.mower_status') in ['error','stuck'] else 'completed' }}"
+      default:
+      - action: persistent_notification.create
+        data:
+          title: "Mow Yard — Inferring Back Outcome (Script Died)"
+          notification_id: mow_yard
+          message: '{{ now().strftime(''%-I:%M %p, %A, %B %-d'') }} — Detected mower return without a live backyard script. Inferring outcome as {{ ''ended_early'' if states(''sensor.mower_status'') in [''error'',''stuck''] else ''completed'' }}.'
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.mow_backyard_stop_time
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - variables:
+          dur_secs: "{{ (as_timestamp(now()) - as_timestamp(states('input_datetime.mow_backyard_start_time'), 0)) | int }}"
+      - if: "{{ dur_secs > 0 }}"
+        then:
+        - action: input_text.set_value
+          target:
+            entity_id: input_text.mow_backyard_duration
+          data:
+            value: >-
+              {% set h = dur_secs // 3600 %}{% set m = (dur_secs % 3600) // 60 %}{% if h > 0 %}{{ h }}h {{ m }}m{% else %}{{ m }}m{% endif %}
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.mow_back_outcome
+        data:
+          value: "{{ 'ended_early' if states('sensor.mower_status') in ['error','stuck'] else 'completed' }}"
+    mode: single
+
+  # 5. Recovery on HA start — if a run was in progress when HA restarted, wait
+  #    for the integration to come back, settle, then resume by phase. Charge-
+  #    wait phases resume naturally via charge_ready, so this only re-kicks a
+  #    mowing phase when the mower is docked. If it's still mowing (continued
+  #    autonomously through the outage), the advance automations catch it on
+  #    return.
+  - id: mow_yard_recovery_on_ha_start
+    alias: Mow Yard — Recovery on HA Start
+    description: >-
+      On HA start with an active orchestration, wait for lawn_mower.luba_3 to be
+      valid and freshly updated (proves the integration is polling again), give
+      it a settle delay, then resume the right script by phase.
+    triggers:
+    - trigger: homeassistant
+      event: start
+    conditions:
+    - condition: state
+      entity_id: input_boolean.mow_yard_active
+      state: 'on'
+    actions:
+    - action: persistent_notification.create
+      data:
+        title: "Mow All Lawns — Recovering from HA Restart"
+        notification_id: mow_yard
+        message: 'Detected an active orchestration after HA restart (phase: {{ states(''input_select.mow_yard_phase'') }}). Waiting for the Mammotion integration to come back online, then resuming.'
+    - wait_template: >
+        {{ states('lawn_mower.luba_3') not in ['unknown','unavailable','none']
+           and (now() - states.lawn_mower.luba_3.last_updated).total_seconds() < 120 }}
+      timeout: '00:05:00'
+      continue_on_timeout: false
+    - delay: '00:02:00'
+    - choose:
+      - conditions:
+        - condition: state
+          entity_id: input_select.mow_yard_phase
+          state: front_1
+        - condition: state
+          entity_id: lawn_mower.luba_3
+          state: docked
+        sequence:
+        - action: script.turn_on
+          target:
+            entity_id: script.mow_the_front_yard
+      - conditions:
+        - condition: state
+          entity_id: input_select.mow_yard_phase
+          state: back_after_front_ok
+        - condition: state
+          entity_id: lawn_mower.luba_3
+          state: docked
+        sequence:
+        - action: script.turn_on
+          target:
+            entity_id: script.mow_the_backyard
+      # Stale state — active on but phase idle (shouldn't happen). Clean it up.
+      - conditions:
+        - condition: state
+          entity_id: input_select.mow_yard_phase
+          state: idle
+        sequence:
+        - action: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.mow_yard_active
+        - action: persistent_notification.create
+          data:
+            title: "Mow All Lawns — Cleared Stale Recovery State"
+            notification_id: mow_yard
+            message: 'Found mow_yard_active on with phase=idle after restart. Cleared the active flag.'
+    mode: single
+
+  # ---------------------------------------------------------------------------
+  # OPTIONAL charge trackers — informational notifications only. Delete freely.
+  # ---------------------------------------------------------------------------
+  # These use core-available signals so they work without any extra hardware. In
+  # our private config we drove them off a smart-plug charge sensor
+  # (binary_sensor.mower_charging_plug) and a de-flapped battery
+  # (sensor.luba_3_battery_stable) for precision; if you build those, point the
+  # triggers at them instead to avoid false fires from battery-telemetry blips.
+  - id: luba_mower_charge_start_tracker
+    alias: Luba Mower Charge Start Tracker
+    description: Records the timestamp when the mower returns to the dock (a proxy
+      for "charging started"), for the 80%-charged notification's elapsed time.
+    triggers:
+    - trigger: state
+      entity_id: binary_sensor.mower_charging
+      from: 'off'
+      to: 'on'
+    actions:
+    - action: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.luba_charge_start_time
+      data:
+        timestamp: '{{ now().timestamp() }}'
+    mode: single
+
+  - id: luba_battery_80_percent_charged
+    alias: Luba Mower 80% Charged Notification
+    description: Notifies 15 minutes after the mower battery has sustained 80% or
+      higher, including total elapsed charge time since it docked.
+    triggers:
+    - trigger: numeric_state
+      entity_id: sensor.luba_3_battery
+      above: 79
+      for:
+        minutes: 15
+    actions:
+    - action: persistent_notification.create
+      data:
+        title: "Mower — 80% Charged"
+        message: >-
+          {{ now().strftime('%B %-d, %-I:%M %p') }} — The mower battery has been at
+          80% or higher for 15 minutes (currently {{ states('sensor.luba_3_battery') }}%).
+          {% set start_ts = state_attr('input_datetime.luba_charge_start_time', 'timestamp') | float(0) %}
+          {% if start_ts > 0 %}{% set elapsed = (now().timestamp() - start_ts) | int %}
+          {% set h = elapsed // 3600 %}{% set m = (elapsed % 3600) // 60 %}Total charge time:
+          {% if h > 0 %}{{ h }}h {{ m }}m{% else %}{{ m }}m{% endif %}.{% endif %}
+    mode: single
