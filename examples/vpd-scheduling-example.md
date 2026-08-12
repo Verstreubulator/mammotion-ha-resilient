@@ -1,21 +1,23 @@
 # Smart Mow — hands-off mowing, within the rules you set (a worked example)
 
 **What this is, in plain terms:** a way to let the mower cut the grass **on its own**,
-but only when the conditions you choose are met — the grass is dry, it hasn't just
-rained, the battery is charged, and it's within the hours you allow. You set the rules
-once; the system decides when to actually run. There's no fixed timer to babysit.
+but only when the conditions you choose are met — the grass is dry, it has not recently
+rained, the battery is charged, and it is within the hours you allow. You set the rules
+once; the system determines when to run. There is no fixed timer to maintain.
 
-The interesting part is answering *"is the grass dry enough to mow yet?"* We don't guess
-from the clock — we read a simple weather measure of **how fast the grass is drying** and
-mow once it crosses a line you set. Because that measure follows the real weather, the
-mower naturally waits later on a cool, damp morning and goes earlier on a hot, dry one,
-and it keeps adjusting through the seasons with no rescheduling from you.
+The central question it answers is *"is the grass dry enough to mow yet?"* Rather than
+guess from the clock, it reads a simple weather measure of **how fast the grass is
+drying** and mows once that measure crosses a threshold you set. Because the measure
+follows the actual weather, the mower waits later on a cool, damp morning and runs
+earlier on a hot, dry one, and it continues to adjust through the seasons without any
+rescheduling on your part.
 
 That "how fast things dry" measure has a technical name — **VPD (vapor-pressure
-deficit)** — but don't let the jargon put you off: think of it as **how thirsty the air
-is.** High = warm and dry, so things dry fast; low = cool and damp, so they dry slowly.
-(There's a plain-English explainer and a copy-paste sensor to calculate it in the repo,
-so you don't need to understand the physics to use this.)
+deficit)** — but the name is not important. In plain terms it is a measure of **how
+thirsty the air is:** high when it is warm and dry (things dry quickly), low when it is
+cool and damp (things dry slowly). A plain-English explainer and a copy-paste sensor to
+calculate it are included in the repo, so no background in the underlying physics is
+required to use this.
 
 It is shared as **inspiration, not a package to install** — every entity name here is
 ours, and the logic is tuned to our two lawns, our sensors, and our Luba 3. Read it
