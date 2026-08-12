@@ -1,0 +1,46 @@
+# =============================================================================
+# A VPD (vapor-pressure deficit) sensor from temperature + humidity
+# =============================================================================
+# VPD is not something your hardware reports directly — it's CALCULATED from an
+# air TEMPERATURE and a RELATIVE HUMIDITY reading, both of which you almost
+# certainly already have (a weather-station integration, a BME280 / SHT sensor, a
+# Zigbee temp/humidity puck, etc.). This template sensor does that calculation and
+# gives you `sensor.outdoor_vpd` in kPa — the "go-signal" the Smart Mow example
+# uses. Drop it in `config/packages/` (or merge into an existing template block),
+# point the two <<< EDIT lines at your own sensors, and reload templates.
+#
+# THE MATH (air VPD, Tetens/Magnus form):
+#   SVP (saturation vapor pressure, kPa) = 0.61078 * e^( (17.27 * T) / (T + 237.3) )   # T in °C
+#   AVP (actual vapor pressure, kPa)     = SVP * (RH / 100)
+#   VPD (kPa)                            = SVP - AVP = SVP * (1 - RH/100)
+# Higher VPD = drier, thirstier air = grass/dew dries faster. Rough feel:
+#   < 0.4 kPa very damp (dew likely) · ~0.8-1.2 comfortably drying · > 1.5 hot & dry.
+# Pick your own per-lawn threshold empirically — watch the value against how the
+# grass actually feels for a week.
+#
+# UNITS: the formula needs °C. If your temperature sensor reports °F, uncomment the
+# Fahrenheit conversion line below.
+# =============================================================================
+
+template:
+  - sensor:
+      - name: "Outdoor VPD"
+        unique_id: outdoor_vpd
+        unit_of_measurement: "kPa"
+        state_class: measurement
+        icon: mdi:water-percent
+        availability: >-
+          {{ states('sensor.YOUR_OUTDOOR_TEMPERATURE') | float(none) is not none
+             and states('sensor.YOUR_OUTDOOR_HUMIDITY')   | float(none) is not none }}
+        state: >-
+          {% set t  = states('sensor.YOUR_OUTDOOR_TEMPERATURE') | float(none) %}
+          {% set rh = states('sensor.YOUR_OUTDOOR_HUMIDITY')   | float(none) %}
+          {# --- If your temperature sensor is in °F, UNCOMMENT the next line: --- #}
+          {# {% set t = (t - 32) * 5 / 9 %} #}
+          {% set svp = 0.61078 * (2.718281828459045 ** ((17.27 * t) / (t + 237.3))) %}
+          {% set vpd = svp * (1 - (rh / 100)) %}
+          {{ vpd | round(3) }}
+
+# If you have several temp/humidity spots and want a smoother number, average a few
+# VPD sensors (or average the inputs) into a "combined" VPD — that's what our real
+# setup does with `sensor.outdoor_vpd_combined`. A single sensor works fine to start.

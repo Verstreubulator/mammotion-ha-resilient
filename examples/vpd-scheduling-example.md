@@ -1,10 +1,18 @@
 # VPD-driven mow scheduling — a worked example (not a drop-in)
 
 This is a walk-through of how we let **vapor-pressure deficit (VPD)** decide *when*
-to mow each day, per lawn, on top of a cadence and a rain veto. It is shared as
-**inspiration, not a package to install** — every entity name here is ours, and
-the logic is tuned to our two lawns, our sensors, and our Luba 3. Read it for the
-ideas, then adapt to whatever you have.
+to mow each day, per lawn, on top of a cadence and a rain veto.
+
+**Its purpose in one line:** estimate **when the grass is dry enough to mow** as
+conditions change — through the hours of a day, across variable weather, and from
+season to season — instead of trusting a fixed clock time that's only ever right for
+a few weeks of the year. The same VPD threshold that fires mid-morning in dry August
+heat naturally waits until afternoon on a damp October day, with no rescheduling on
+your part: the physics does the adjusting.
+
+It is shared as **inspiration, not a package to install** — every entity name here is
+ours, and the logic is tuned to our two lawns, our sensors, and our Luba 3. Read it
+for the ideas, then adapt to whatever you have.
 
 The full annotated source is next to this file:
 [`mow_vpd_driven.reference.yaml`](./mow_vpd_driven.reference.yaml). That file is
@@ -37,13 +45,32 @@ go-signal. The rain veto is shipped separately and generically as
 
 ---
 
+## First: where does a VPD sensor come from?
+
+VPD isn't something your hardware reports — Home Assistant has no built-in VPD
+sensor. You **calculate** it from two readings you almost certainly already have: an
+air **temperature** and a **relative humidity**. The formula (air VPD, Tetens form):
+
+```
+SVP (saturation vapor pressure, kPa) = 0.61078 * e^( (17.27 * T) / (T + 237.3) )   # T in °C
+VPD (kPa)                            = SVP * (1 - RH/100)
+```
+
+Higher VPD = drier, thirstier air = grass and dew dry faster. A copy-paste template
+sensor that produces `sensor.outdoor_vpd` from your own temperature + humidity
+entities is right next to this file:
+[`vpd_sensor.yaml`](./vpd_sensor.yaml) — edit the two sensor names, handle °F vs °C,
+reload. Everything below assumes you've created a VPD sensor that way (ours is
+`sensor.outdoor_vpd_combined`, an average of a few spots; a single one is fine to
+start).
+
 ## What it assumes you have
 
 You would swap each of these for your own equivalents:
 
 | Role | Our entity | Notes |
 |------|-----------|-------|
-| VPD (outdoor), kPa | `sensor.outdoor_vpd_combined` | The go-signal. Any VPD sensor works. |
+| VPD (outdoor), kPa | `sensor.outdoor_vpd_combined` | The go-signal. Calculate it from temp + humidity — see [`vpd_sensor.yaml`](./vpd_sensor.yaml). |
 | Rain veto | `binary_sensor.mow_lawn_wet`, `binary_sensor.mow_rain_significant` | See `mammotion_rain_gate.yaml` for a generic `binary_sensor.mow_rain_veto`. |
 | The mower | `lawn_mower.luba_3`, `sensor.luba_3_*`, `number.luba_3_working_speed` | `luba_3` is our mower's slug — rename to yours. |
 | Derived status | `sensor.mower_status`, `binary_sensor.lawn_mower_active`, `binary_sensor.mower_charged`, `sensor.mammotion_integration_status` | From the core packages in this repo. |
