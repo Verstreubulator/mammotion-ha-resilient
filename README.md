@@ -71,7 +71,7 @@ zone-switch fix alone will make your existing automations stop breaking on every
 | **Charge plug** | [`packages/mammotion_charge_plug.yaml`](packages/mammotion_charge_plug.yaml) | A rock-steady, restart-proof "charge complete" signal from a smart plug on the dock — the upgrade that made *our* setup dependable, because our mower's battery telemetry flaps. Optional, but recommended if yours flaps too. | Layer 1 + a power-metering smart plug |
 | **Rain gating** | [`packages/mammotion_rain_gate.yaml`](packages/mammotion_rain_gate.yaml) | A generic "don't mow wet grass" veto (accumulation-based, wired to your own rain sensor) | Layer 1 + your rain sensor |
 | **Voice** | [`voice/`](voice/) | Home Assistant Assist voice control + quiet-aware spoken announcements | Layers 1–2 |
-| **Smart Mow (VPD)** | [`examples/`](examples/vpd-scheduling-example.md) | Our fully-automatic scheduler — it estimates **when the grass is dry enough to mow** as weather and seasons change (via vapor-pressure deficit + per-yard cadence + rain veto), instead of a fixed clock time. Shipped as a **featured reference + walkthrough** (verbatim config you adapt), not a turnkey install — it's tied to our specific climate sensors. | Your own climate/soil/rain sensors |
+| **Smart Mow** | [`examples/`](examples/vpd-scheduling-example.md) | Lets the mower **cut the grass on its own — but only when the conditions you set are met**: the grass is dry, it hasn't just rained, the battery's charged, and it's within the hours you allow. You set the rules once; it decides when to actually run, and adapts to the day and the season instead of following a fixed clock. Shipped as a **featured reference + walkthrough** (verbatim config you adapt), not a turnkey install. | Your own weather/soil sensors |
 
 > **A note on the gate.** In our own yard one lawn sits behind a physical garden gate, so our flow
 > checks a gate sensor before mowing that zone. We deliberately **left that out of the shipped
@@ -84,7 +84,8 @@ zone-switch fix alone will make your existing automations stop breaking on every
   automations, helpers).
 - It does not make a flaky BLE link reliable — it recovers *cleanly* when the link drops, but good
   BLE proxy coverage is still on you.
-- The VPD scheduling and the specific rain sensors are **tied to our hardware**. They're included as
+- The Smart Mow scheduling (the weather-driven autonomous mowing) and the specific rain sensors are
+  **tied to our hardware**. They're included as
   documented examples to adapt, not turnkey installs.
 
 ## Versions we run (as of this writing)
