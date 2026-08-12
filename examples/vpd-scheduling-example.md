@@ -19,6 +19,13 @@ cool and damp (things dry slowly). A plain-English explainer and a copy-paste se
 calculate it are included in the repo, so no background in the underlying physics is
 required to use this.
 
+Worth saying plainly: most robot-mower scheduling is just a weekly calendar — mow on
+these days at this time. Driving the mow off live weather and each lawn's actual
+condition, so the mower decides for itself when the grass is genuinely ready, is an
+unusual approach. We didn't invent the underlying measurement, but this kind of
+application of it is not something most people have seen, and it is the interesting
+part of the system.
+
 It is shared as **inspiration, not a package to install** — every entity name here is
 ours, and the logic is tuned to our two lawns, our sensors, and our Luba 3. Read it
 for the ideas, then adapt to whatever you have.
